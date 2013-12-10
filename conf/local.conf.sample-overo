@@ -1,0 +1,42 @@
+# Local configuration for meta-tvp5151 images
+# Yocto Project 1.4.2 Poky distribution 9.0.2, [dylan] branch
+
+BBMASK = "meta-gumstix/recipes-connectivity"
+BBMASK .= "|meta-ti/recipes-misc"
+BBMASK .= "|meta-ti/recipes-bsp/formfactor"
+BBMASK .= "|meta-ti/recipes-bsp/u-boot"
+
+PREFERRED_PROVIDER_jpeg = "libjpeg-turbo"
+PREFERRED_PROVIDER_udev = "udev"
+
+DISTRO_FEATURES = "ext2 keyboard usbhost wifi ${DISTRO_FEATURES_LIBC}"
+
+IMAGE_FSTYPES_forcevariable = "tar.xz"
+
+MACHINE_FEATURES_forcevariable = "ext2 screen serial usbhost"
+
+BB_NUMBER_THREADS = "4"
+PARALLEL_MAKE = "-j 4"
+
+MACHINE = "overo"
+
+TMPDIR = "/oe18/tmp-poky-dylan-build"
+
+DL_DIR ?= "/oe-sources"
+
+#SSTATE_DIR ?= "${TOPDIR}/sstate-cache"
+
+DISTRO = "poky"
+
+PACKAGE_CLASSES = "package_ipk"
+
+# i686 or x86_64
+SDKMACHINE = "x86_64"
+
+EXTRA_IMAGE_FEATURES = "debug-tweaks"
+
+USER_CLASSES ?= "image-mklibs image-prelink"
+
+PATCHRESOLVE = "noop"
+
+CONF_VERSION = "1"

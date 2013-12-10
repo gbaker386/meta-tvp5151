@@ -1,0 +1,22 @@
+# LAYER_CONF_VERSION is increased each time build/conf/bblayers.conf
+# changes incompatibly
+LCONF_VERSION = "6"
+
+BBPATH = "${TOPDIR}"
+BBFILES ?= ""
+
+BBLAYERS ?= " \
+  /home/scott/poky-dylan/meta \
+  /home/scott/poky-dylan/meta-yocto \
+  /home/scott/poky-dylan/meta-openembedded/meta-oe \
+  /home/scott/poky-dylan/meta-openembedded/meta-networking \
+  /home/scott/poky-dylan/meta-gumstix \
+  /home/scott/tvp5151/meta-ti \
+  /home/scott/tvp5151/meta-tvp5151 \
+  "
+
+BBLAYERS_NON_REMOVABLE ?= " \
+  /home/scott/poky-dylan/meta \
+  /home/scott/poky-dylan/meta-yocto \
+  "
+
