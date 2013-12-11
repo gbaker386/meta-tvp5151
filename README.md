@@ -15,10 +15,10 @@ This layer depends on:
         revision: HEAD
         commit: f104087 
 
-	URI: git://git.yoctoproject.org/meta-ti
-	branch: tvp5151 (branched from dylan)
+	URI: git://github.com/scottellis/meta-ti
+	branch: dylan-fix
 	revision: HEAD
-	commit: ???
+	commit: 5b60142 
 
         meta-tv5151 layer maintainer: Scott Ellis <scott@pansenti.com>
 
