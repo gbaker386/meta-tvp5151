@@ -6,6 +6,7 @@ PR = "1"
 
 DSP_INSTALL += " \
     gstreamer-ti \
+    gst-plugins-base-meta \
     gst-plugins-good-meta \
     gst-plugins-bad-meta \
  "
