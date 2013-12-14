@@ -1,0 +1,2337 @@
+Index: git/drivers/media/video/omap3isp/isp.c
+===================================================================
+--- git.orig/drivers/media/video/omap3isp/isp.c	2012-10-23 10:10:18.815169503 -0500
++++ git/drivers/media/video/omap3isp/isp.c	2012-10-23 10:10:28.051169309 -0500
+@@ -252,13 +252,18 @@
+ }
+ 
+ /*
+- * isp_power_settings - Sysconfig settings, for Power Management.
++ * isp_core_init - ISP core settings
+  * @isp: OMAP3 ISP device
+  * @idle: Consider idle state.
+  *
+- * Sets the power settings for the ISP, and SBL bus.
++ * Set the power settings for the ISP and SBL bus and cConfigure the HS/VS
++ * interrupt source.
++ *
++ * We need to configure the HS/VS interrupt source before interrupts get
++ * enabled, as the sensor might be free-running and the ISP default setting
++ * (HS edge) would put an unnecessary burden on the CPU.
+  */
+-static void isp_power_settings(struct isp_device *isp, int idle)
++static void isp_core_init(struct isp_device *isp, int idle)
+ {
+ 	isp_reg_writel(isp,
+ 		       ((idle ? ISP_SYSCONFIG_MIDLEMODE_SMARTSTANDBY :
+@@ -268,9 +273,10 @@
+ 			  ISP_SYSCONFIG_AUTOIDLE : 0),
+ 		       OMAP3_ISP_IOMEM_MAIN, ISP_SYSCONFIG);
+ 
+-	if (isp->autoidle)
+-		isp_reg_writel(isp, ISPCTRL_SBL_AUTOIDLE, OMAP3_ISP_IOMEM_MAIN,
+-			       ISP_CTRL);
++	isp_reg_writel(isp,
++		       (isp->autoidle ? ISPCTRL_SBL_AUTOIDLE : 0) |
++		       ISPCTRL_SYNC_DETECT_VSRISE,
++		       OMAP3_ISP_IOMEM_MAIN, ISP_CTRL);
+ }
+ 
+ /*
+@@ -287,7 +293,7 @@
+ void omap3isp_configure_bridge(struct isp_device *isp,
+ 			       enum ccdc_input_entity input,
+ 			       const struct isp_parallel_platform_data *pdata,
+-			       unsigned int shift)
++			       unsigned int shift, unsigned int bridge)
+ {
+ 	u32 ispctrl_val;
+ 
+@@ -296,12 +302,12 @@
+ 	ispctrl_val &= ~ISPCTRL_PAR_CLK_POL_INV;
+ 	ispctrl_val &= ~ISPCTRL_PAR_SER_CLK_SEL_MASK;
+ 	ispctrl_val &= ~ISPCTRL_PAR_BRIDGE_MASK;
++	ispctrl_val |= bridge;
+ 
+ 	switch (input) {
+ 	case CCDC_INPUT_PARALLEL:
+ 		ispctrl_val |= ISPCTRL_PAR_SER_CLK_SEL_PARALLEL;
+ 		ispctrl_val |= pdata->clk_pol << ISPCTRL_PAR_CLK_POL_SHIFT;
+-		ispctrl_val |= pdata->bridge << ISPCTRL_PAR_BRIDGE_SHIFT;
+ 		shift += pdata->data_lane_shift * 2;
+ 		break;
+ 
+@@ -323,9 +329,6 @@
+ 
+ 	ispctrl_val |= ((shift/2) << ISPCTRL_SHIFT_SHIFT) & ISPCTRL_SHIFT_MASK;
+ 
+-	ispctrl_val &= ~ISPCTRL_SYNC_DETECT_MASK;
+-	ispctrl_val |= ISPCTRL_SYNC_DETECT_VSRISE;
+-
+ 	isp_reg_writel(isp, ispctrl_val, OMAP3_ISP_IOMEM_MAIN, ISP_CTRL);
+ }
+ 
+@@ -1281,7 +1284,9 @@
+ {
+ 	u32 clk = 0;
+ 
+-	if (isp->subclk_resources & OMAP3_ISP_SUBCLK_H3A)
++	/* AEWB and AF share the same clock. */
++	if (isp->subclk_resources &
++	    (OMAP3_ISP_SUBCLK_AEWB | OMAP3_ISP_SUBCLK_AF))
+ 		clk |= ISPCTRL_H3A_CLK_EN;
+ 
+ 	if (isp->subclk_resources & OMAP3_ISP_SUBCLK_HIST)
+@@ -1441,7 +1446,7 @@
+  *
+  * Return a pointer to the ISP device structure, or NULL if an error occurred.
+  */
+-struct isp_device *omap3isp_get(struct isp_device *isp)
++static struct isp_device *__omap3isp_get(struct isp_device *isp, bool irq)
+ {
+ 	struct isp_device *__isp = isp;
+ 
+@@ -1460,10 +1465,9 @@
+ 	/* We don't want to restore context before saving it! */
+ 	if (isp->has_context)
+ 		isp_restore_ctx(isp);
+-	else
+-		isp->has_context = 1;
+ 
+-	isp_enable_interrupts(isp);
++	if (irq)
++		isp_enable_interrupts(isp);
+ 
+ out:
+ 	if (__isp != NULL)
+@@ -1473,6 +1477,11 @@
+ 	return __isp;
+ }
+ 
++struct isp_device *omap3isp_get(struct isp_device *isp)
++{
++	return __omap3isp_get(isp, true);
++}
++
+ /*
+  * omap3isp_put - Release the ISP
+  *
+@@ -1488,8 +1497,10 @@
+ 	BUG_ON(isp->ref_count == 0);
+ 	if (--isp->ref_count == 0) {
+ 		isp_disable_interrupts(isp);
+-		if (isp->domain)
++		if (isp->domain) {
+ 			isp_save_ctx(isp);
++			isp->has_context = 1;
++		}
+ 		/* Reset the ISP if an entity has failed to stop. This is the
+ 		 * only way to recover from such conditions.
+ 		 */
+@@ -1973,7 +1984,7 @@
+ 	isp_unregister_entities(isp);
+ 	isp_cleanup_modules(isp);
+ 
+-	omap3isp_get(isp);
++	__omap3isp_get(isp, false);
+ 	iommu_detach_device(isp->domain, &pdev->dev);
+ 	iommu_domain_free(isp->domain);
+ 	isp->domain = NULL;
+@@ -2091,7 +2102,7 @@
+ 	if (ret < 0)
+ 		goto error;
+ 
+-	if (omap3isp_get(isp) == NULL)
++	if (__omap3isp_get(isp, false) == NULL)
+ 		goto error;
+ 
+ 	ret = isp_reset(isp);
+@@ -2158,7 +2169,7 @@
+ 	if (ret < 0)
+ 		goto error_modules;
+ 
+-	isp_power_settings(isp, 1);
++	isp_core_init(isp, 1);
+ 	omap3isp_put(isp);
+ 
+ 	return 0;
+Index: git/drivers/media/video/omap3isp/isp.h
+===================================================================
+--- git.orig/drivers/media/video/omap3isp/isp.h	2012-10-23 10:10:18.815169503 -0500
++++ git/drivers/media/video/omap3isp/isp.h	2012-10-23 10:10:28.051169309 -0500
+@@ -90,10 +90,11 @@
+ 
+ enum isp_subclk_resource {
+ 	OMAP3_ISP_SUBCLK_CCDC		= (1 << 0),
+-	OMAP3_ISP_SUBCLK_H3A		= (1 << 1),
+-	OMAP3_ISP_SUBCLK_HIST		= (1 << 2),
+-	OMAP3_ISP_SUBCLK_PREVIEW	= (1 << 3),
+-	OMAP3_ISP_SUBCLK_RESIZER	= (1 << 4),
++	OMAP3_ISP_SUBCLK_AEWB		= (1 << 1),
++	OMAP3_ISP_SUBCLK_AF		= (1 << 2),
++	OMAP3_ISP_SUBCLK_HIST		= (1 << 3),
++	OMAP3_ISP_SUBCLK_PREVIEW	= (1 << 4),
++	OMAP3_ISP_SUBCLK_RESIZER	= (1 << 5),
+ };
+ 
+ /* ISP: OMAP 34xx ES 1.0 */
+@@ -235,7 +236,7 @@
+ void omap3isp_configure_bridge(struct isp_device *isp,
+ 			       enum ccdc_input_entity input,
+ 			       const struct isp_parallel_platform_data *pdata,
+-			       unsigned int shift);
++			       unsigned int shift, unsigned int bridge);
+ 
+ struct isp_device *omap3isp_get(struct isp_device *isp);
+ void omap3isp_put(struct isp_device *isp);
+Index: git/drivers/media/video/omap3isp/ispccdc.c
+===================================================================
+--- git.orig/drivers/media/video/omap3isp/ispccdc.c	2012-10-23 10:10:18.815169503 -0500
++++ git/drivers/media/video/omap3isp/ispccdc.c	2012-10-23 13:04:26.426950270 -0500
+@@ -61,8 +61,12 @@
+ 	V4L2_MBUS_FMT_SRGGB12_1X12,
+ 	V4L2_MBUS_FMT_SBGGR12_1X12,
+ 	V4L2_MBUS_FMT_SGBRG12_1X12,
++	V4L2_MBUS_FMT_YUYV8_2X8,
++	V4L2_MBUS_FMT_UYVY8_2X8,
+ };
+ 
++static bool ccdc_input_is_bt656(struct isp_ccdc_device *ccdc);
++
+ /*
+  * ccdc_print_status - Print current CCDC Module register values.
+  * @ccdc: Pointer to ISP CCDC device.
+@@ -627,9 +631,12 @@
+ static void ccdc_configure_alaw(struct isp_ccdc_device *ccdc)
+ {
+ 	struct isp_device *isp = to_isp_device(ccdc);
++	const struct isp_format_info *info;
+ 	u32 alaw = 0;
+ 
+-	switch (ccdc->syncif.datsz) {
++	info = omap3isp_video_format_info(ccdc->formats[CCDC_PAD_SINK].code);
++
++	switch (info->width) {
+ 	case 8:
+ 		return;
+ 
+@@ -792,11 +799,16 @@
+ void omap3isp_ccdc_restore_context(struct isp_device *isp)
+ {
+ 	struct isp_ccdc_device *ccdc = &isp->isp_ccdc;
++	struct v4l2_mbus_framefmt *format;
+ 
+ 	isp_reg_set(isp, OMAP3_ISP_IOMEM_CCDC, ISPCCDC_CFG, ISPCCDC_CFG_VDLC);
+ 
+-	ccdc->update = OMAP3ISP_CCDC_ALAW | OMAP3ISP_CCDC_LPF
+-		     | OMAP3ISP_CCDC_BLCLAMP | OMAP3ISP_CCDC_BCOMP;
++	/* CCDC_PAD_SINK */
++	format = &ccdc->formats[CCDC_PAD_SINK];
++	if ((format->code != V4L2_MBUS_FMT_UYVY8_2X8) &&
++            (format->code != V4L2_MBUS_FMT_UYVY8_2X8))
++		ccdc->update = OMAP3ISP_CCDC_ALAW | OMAP3ISP_CCDC_LPF |
++			       OMAP3ISP_CCDC_BLCLAMP | OMAP3ISP_CCDC_BCOMP;
+ 	ccdc_apply_controls(ccdc);
+ 	ccdc_configure_fpc(ccdc);
+ }
+@@ -813,6 +825,7 @@
+ {
+ 	struct isp_pipeline *pipe = to_isp_pipeline(&ccdc->subdev.entity);
+ 	struct isp_device *isp = to_isp_device(ccdc);
++	const struct isp_format_info *info;
+ 	unsigned long l3_ick = pipe->l3_ick;
+ 	unsigned int max_div = isp->revision == ISP_REVISION_15_0 ? 64 : 8;
+ 	unsigned int div = 0;
+@@ -821,7 +834,9 @@
+ 	fmtcfg_vp = isp_reg_readl(isp, OMAP3_ISP_IOMEM_CCDC, ISPCCDC_FMTCFG)
+ 		  & ~(ISPCCDC_FMTCFG_VPIN_MASK | ISPCCDC_FMTCFG_VPIF_FRQ_MASK);
+ 
+-	switch (ccdc->syncif.datsz) {
++	info = omap3isp_video_format_info(ccdc->formats[CCDC_PAD_SINK].code);
++
++	switch (info->width) {
+ 	case 8:
+ 	case 10:
+ 		fmtcfg_vp |= ISPCCDC_FMTCFG_VPIN_9_0;
+@@ -835,7 +850,7 @@
+ 	case 13:
+ 		fmtcfg_vp |= ISPCCDC_FMTCFG_VPIN_12_3;
+ 		break;
+-	};
++	}
+ 
+ 	if (pipe->input)
+ 		div = DIV_ROUND_UP(l3_ick, pipe->max_rate);
+@@ -959,26 +974,31 @@
+ /*
+  * ccdc_config_sync_if - Set CCDC sync interface configuration
+  * @ccdc: Pointer to ISP CCDC device.
+- * @syncif: Structure containing the sync parameters like field state, CCDC in
+- *          master/slave mode, raw/yuv data, polarity of data, field, hs, vs
+- *          signals.
++ * @pdata: Parallel interface platform data (may be NULL)
++ * @data_size: Data size
+  */
+ static void ccdc_config_sync_if(struct isp_ccdc_device *ccdc,
+-				struct ispccdc_syncif *syncif)
++				struct isp_parallel_platform_data *pdata,
++				unsigned int data_size)
+ {
+ 	struct isp_device *isp = to_isp_device(ccdc);
+-	u32 syn_mode = isp_reg_readl(isp, OMAP3_ISP_IOMEM_CCDC,
+-				     ISPCCDC_SYN_MODE);
++	const struct v4l2_mbus_framefmt *format;
++	u32 syn_mode = ISPCCDC_SYN_MODE_VDHDEN;
+ 
+-	syn_mode |= ISPCCDC_SYN_MODE_VDHDEN;
++	format = &ccdc->formats[CCDC_PAD_SINK];
+ 
+-	if (syncif->fldstat)
+-		syn_mode |= ISPCCDC_SYN_MODE_FLDSTAT;
+-	else
+-		syn_mode &= ~ISPCCDC_SYN_MODE_FLDSTAT;
++	if (format->code == V4L2_MBUS_FMT_YUYV8_2X8 ||
++	    format->code == V4L2_MBUS_FMT_UYVY8_2X8) {
++		/* The bridge is enabled for non-BT.656 YUV8 formats. Configure
++		 * the input mode accordingly.
++		 */
++		if (pdata && pdata->bt656)
++			syn_mode |= ISPCCDC_SYN_MODE_INPMOD_YCBCR8;
++		else
++			syn_mode |= ISPCCDC_SYN_MODE_INPMOD_YCBCR16;
++	}
+ 
+-	syn_mode &= ~ISPCCDC_SYN_MODE_DATSIZ_MASK;
+-	switch (syncif->datsz) {
++	switch (data_size) {
+ 	case 8:
+ 		syn_mode |= ISPCCDC_SYN_MODE_DATSIZ_8;
+ 		break;
+@@ -991,55 +1011,38 @@
+ 	case 12:
+ 		syn_mode |= ISPCCDC_SYN_MODE_DATSIZ_12;
+ 		break;
+-	};
+-
+-	if (syncif->fldmode)
+-		syn_mode |= ISPCCDC_SYN_MODE_FLDMODE;
+-	else
+-		syn_mode &= ~ISPCCDC_SYN_MODE_FLDMODE;
++	}
+ 
+-	if (syncif->datapol)
++	if (pdata && pdata->data_pol)
+ 		syn_mode |= ISPCCDC_SYN_MODE_DATAPOL;
+-	else
+-		syn_mode &= ~ISPCCDC_SYN_MODE_DATAPOL;
+-
+-	if (syncif->fldpol)
+-		syn_mode |= ISPCCDC_SYN_MODE_FLDPOL;
+-	else
+-		syn_mode &= ~ISPCCDC_SYN_MODE_FLDPOL;
+ 
+-	if (syncif->hdpol)
++	if (pdata && pdata->hs_pol)
+ 		syn_mode |= ISPCCDC_SYN_MODE_HDPOL;
+-	else
+-		syn_mode &= ~ISPCCDC_SYN_MODE_HDPOL;
+ 
+-	if (syncif->vdpol)
++	if (pdata && pdata->vs_pol)
+ 		syn_mode |= ISPCCDC_SYN_MODE_VDPOL;
+-	else
+-		syn_mode &= ~ISPCCDC_SYN_MODE_VDPOL;
+-
+-	if (syncif->ccdc_mastermode) {
+-		syn_mode |= ISPCCDC_SYN_MODE_FLDOUT | ISPCCDC_SYN_MODE_VDHDOUT;
+-		isp_reg_writel(isp,
+-			       syncif->hs_width << ISPCCDC_HD_VD_WID_HDW_SHIFT
+-			     | syncif->vs_width << ISPCCDC_HD_VD_WID_VDW_SHIFT,
+-			       OMAP3_ISP_IOMEM_CCDC,
+-			       ISPCCDC_HD_VD_WID);
+ 
+-		isp_reg_writel(isp,
+-			       syncif->ppln << ISPCCDC_PIX_LINES_PPLN_SHIFT
+-			     | syncif->hlprf << ISPCCDC_PIX_LINES_HLPRF_SHIFT,
+-			       OMAP3_ISP_IOMEM_CCDC,
+-			       ISPCCDC_PIX_LINES);
+-	} else
+-		syn_mode &= ~(ISPCCDC_SYN_MODE_FLDOUT |
+-			      ISPCCDC_SYN_MODE_VDHDOUT);
++	if (pdata && pdata->fldmode)
++		syn_mode |= ISPCCDC_SYN_MODE_FLDMODE;
+ 
+ 	isp_reg_writel(isp, syn_mode, OMAP3_ISP_IOMEM_CCDC, ISPCCDC_SYN_MODE);
+ 
+-	if (!syncif->bt_r656_en)
++	/* The CCDC_CFG.Y8POS bit is used in YCbCr8 input mode only. The
++	 * hardware seems to ignore it in all other input modes.
++	 */
++	if (format->code == V4L2_MBUS_FMT_UYVY8_2X8)
++		isp_reg_set(isp, OMAP3_ISP_IOMEM_CCDC, ISPCCDC_CFG,
++			    ISPCCDC_CFG_Y8POS);
++	else
++		isp_reg_clr(isp, OMAP3_ISP_IOMEM_CCDC, ISPCCDC_CFG,
++			    ISPCCDC_CFG_Y8POS);
++
++	if (pdata && pdata->bt656)
++		isp_reg_set(isp, OMAP3_ISP_IOMEM_CCDC, ISPCCDC_REC656IF,
++			    ISPCCDC_REC656IF_R656ON | ISPCCDC_REC656IF_ECCFVH);
++	else
+ 		isp_reg_clr(isp, OMAP3_ISP_IOMEM_CCDC, ISPCCDC_REC656IF,
+-			    ISPCCDC_REC656IF_R656ON);
++			    ISPCCDC_REC656IF_R656ON | ISPCCDC_REC656IF_ECCFVH);
+ }
+ 
+ /* CCDC formats descriptions */
+@@ -1122,12 +1125,14 @@
+ 	struct v4l2_subdev *sensor;
+ 	struct v4l2_mbus_framefmt *format;
+ 	const struct v4l2_rect *crop;
++	struct v4l2_pix_format pix;
+ 	const struct isp_format_info *fmt_info;
+ 	struct v4l2_subdev_format fmt_src;
+ 	unsigned int depth_out;
+ 	unsigned int depth_in = 0;
+ 	struct media_pad *pad;
+ 	unsigned long flags;
++	unsigned int bridge;
+ 	unsigned int shift;
+ 	u32 syn_mode;
+ 	u32 ccdc_pattern;
+@@ -1138,28 +1143,34 @@
+ 		pdata = &((struct isp_v4l2_subdevs_group *)sensor->host_priv)
+ 			->bus.parallel;
+ 
+-	/* Compute shift value for lane shifter to configure the bridge. */
++	/* Compute the lane shifter shift value and enable the bridge when the
++	 * input format is a non-BT.656 YUV variant.
++	 */
+ 	fmt_src.pad = pad->index;
+ 	fmt_src.which = V4L2_SUBDEV_FORMAT_ACTIVE;
+ 	if (!v4l2_subdev_call(sensor, pad, get_fmt, NULL, &fmt_src)) {
+ 		fmt_info = omap3isp_video_format_info(fmt_src.format.code);
+-		depth_in = fmt_info->bpp;
++		depth_in = fmt_info->width;
+ 	}
+ 
+ 	fmt_info = omap3isp_video_format_info
+ 		(isp->isp_ccdc.formats[CCDC_PAD_SINK].code);
+-	depth_out = fmt_info->bpp;
+-
++	depth_out = fmt_info->width;
+ 	shift = depth_in - depth_out;
+-	omap3isp_configure_bridge(isp, ccdc->input, pdata, shift);
+ 
+-	ccdc->syncif.datsz = depth_out;
+-	ccdc->syncif.hdpol = pdata ? pdata->hs_pol : 0;
+-	ccdc->syncif.vdpol = pdata ? pdata->vs_pol : 0;
+-	ccdc_config_sync_if(ccdc, &ccdc->syncif);
++	if (fmt_info->code == V4L2_MBUS_FMT_YUYV8_2X8)
++		bridge = ISPCTRL_PAR_BRIDGE_LENDIAN;
++	else if (fmt_info->code == V4L2_MBUS_FMT_UYVY8_2X8)
++		bridge = ISPCTRL_PAR_BRIDGE_BENDIAN;
++	else
++		bridge = ISPCTRL_PAR_BRIDGE_DISABLE;
+ 
+-	/* CCDC_PAD_SINK */
+-	format = &ccdc->formats[CCDC_PAD_SINK];
++	if (pdata && pdata->bt656)
++		bridge = ISPCTRL_PAR_BRIDGE_DISABLE;
++
++	omap3isp_configure_bridge(isp, ccdc->input, pdata, shift, bridge);
++
++	ccdc_config_sync_if(ccdc, pdata, depth_out);
+ 
+ 	syn_mode = isp_reg_readl(isp, OMAP3_ISP_IOMEM_CCDC, ISPCCDC_SYN_MODE);
+ 
+@@ -1178,13 +1189,12 @@
+ 	else
+ 		syn_mode &= ~ISPCCDC_SYN_MODE_SDR2RSZ;
+ 
+-	/* Use PACK8 mode for 1byte per pixel formats. */
+-	if (omap3isp_video_format_info(format->code)->bpp <= 8)
+-		syn_mode |= ISPCCDC_SYN_MODE_PACK8;
+-	else
+-		syn_mode &= ~ISPCCDC_SYN_MODE_PACK8;
++	/* CCDC_PAD_SINK */
++	format = &ccdc->formats[CCDC_PAD_SINK];
+ 
+-	isp_reg_writel(isp, syn_mode, OMAP3_ISP_IOMEM_CCDC, ISPCCDC_SYN_MODE);
++	if (format->code == V4L2_MBUS_FMT_UYVY8_2X8)
++		isp_reg_set(isp, OMAP3_ISP_IOMEM_CCDC, ISPCCDC_CFG,
++			    ISPCCDC_CFG_Y8POS);
+ 
+ 	/* Mosaic filter */
+ 	switch (format->code) {
+@@ -1205,28 +1215,91 @@
+ 		ccdc_pattern = ccdc_sgrbg_pattern;
+ 		break;
+ 	}
+-	ccdc_config_imgattr(ccdc, ccdc_pattern);
+ 
+-	/* Generate VD0 on the last line of the image and VD1 on the
+-	 * 2/3 height line.
+-	 */
+-	isp_reg_writel(isp, ((format->height - 2) << ISPCCDC_VDINT_0_SHIFT) |
+-		       ((format->height * 2 / 3) << ISPCCDC_VDINT_1_SHIFT),
+-		       OMAP3_ISP_IOMEM_CCDC, ISPCCDC_VDINT);
++	if ((format->code != V4L2_MBUS_FMT_YUYV8_2X8) &&
++			(format->code != V4L2_MBUS_FMT_UYVY8_2X8))
++		ccdc_config_imgattr(ccdc, ccdc_pattern);
++
++	/* BT656: Generate VD0 on the last line of each field, and we
++	* don't use VD1.
++	* Non BT656: Generate VD0 on the last line of the image and VD1 on the
++	* 2/3 height line.
++	*/
++	if (pdata->bt656)
++		isp_reg_writel(isp,
++			(format->height/2 - 2) << ISPCCDC_VDINT_0_SHIFT,
++			OMAP3_ISP_IOMEM_CCDC, ISPCCDC_VDINT);
++	else
++		isp_reg_writel(isp,
++			((format->height - 2) << ISPCCDC_VDINT_0_SHIFT) |
++			((format->height * 2 / 3) << ISPCCDC_VDINT_1_SHIFT),
++			OMAP3_ISP_IOMEM_CCDC, ISPCCDC_VDINT);
+ 
+ 	/* CCDC_PAD_SOURCE_OF */
++	format = &ccdc->formats[CCDC_PAD_SOURCE_OF];
+ 	crop = &ccdc->crop;
+ 
+-	isp_reg_writel(isp, (crop->left << ISPCCDC_HORZ_INFO_SPH_SHIFT) |
+-		       ((crop->width - 1) << ISPCCDC_HORZ_INFO_NPH_SHIFT),
+-		       OMAP3_ISP_IOMEM_CCDC, ISPCCDC_HORZ_INFO);
+-	isp_reg_writel(isp, crop->top << ISPCCDC_VERT_START_SLV0_SHIFT,
+-		       OMAP3_ISP_IOMEM_CCDC, ISPCCDC_VERT_START);
+-	isp_reg_writel(isp, (crop->height - 1)
+-			<< ISPCCDC_VERT_LINES_NLV_SHIFT,
+-		       OMAP3_ISP_IOMEM_CCDC, ISPCCDC_VERT_LINES);
++	isp_video_mbus_to_pix(&ccdc->video_out, format, &pix);
+ 
+-	ccdc_config_outlineoffset(ccdc, ccdc->video_out.bpl_value, 0, 0);
++	/* For BT656 the number of bytes would be width*2 */
++	if (pdata->bt656) {
++		isp_reg_writel(isp, (crop->left << ISPCCDC_HORZ_INFO_SPH_SHIFT) |
++                               ((pix.bytesperline - 1) << ISPCCDC_HORZ_INFO_NPH_SHIFT),
++                               OMAP3_ISP_IOMEM_CCDC, ISPCCDC_HORZ_INFO);
++		isp_reg_writel(isp, (20 << ISPCCDC_VERT_START_SLV0_SHIFT |
++                               20 << ISPCCDC_VERT_START_SLV1_SHIFT),
++			       OMAP3_ISP_IOMEM_CCDC, ISPCCDC_VERT_START);
++		isp_reg_writel(isp, ((format->height >> 1) - 1) << ISPCCDC_VERT_LINES_NLV_SHIFT,
++                               OMAP3_ISP_IOMEM_CCDC, ISPCCDC_VERT_LINES);
++	} else {
++		isp_reg_writel(isp, (crop->left << ISPCCDC_HORZ_INFO_SPH_SHIFT) |
++			       ((crop->width - 1) << ISPCCDC_HORZ_INFO_NPH_SHIFT),
++			       OMAP3_ISP_IOMEM_CCDC, ISPCCDC_HORZ_INFO);
++		isp_reg_writel(isp, crop->top << ISPCCDC_VERT_START_SLV0_SHIFT,
++			       OMAP3_ISP_IOMEM_CCDC, ISPCCDC_VERT_START);
++		isp_reg_writel(isp, (crop->height - 1)
++				<< ISPCCDC_VERT_LINES_NLV_SHIFT,
++			       OMAP3_ISP_IOMEM_CCDC, ISPCCDC_VERT_LINES);
++	}
++
++	isp_reg_clr(isp, OMAP3_ISP_IOMEM_CCDC, ISPCCDC_SDOFST,
++		    ISPCCDC_SDOFST_LOFST_MASK << ISPCCDC_SDOFST_LOFST0_SHIFT);
++	isp_reg_clr(isp, OMAP3_ISP_IOMEM_CCDC, ISPCCDC_SDOFST,
++		    ISPCCDC_SDOFST_LOFST_MASK << ISPCCDC_SDOFST_LOFST1_SHIFT);
++	isp_reg_clr(isp, OMAP3_ISP_IOMEM_CCDC, ISPCCDC_SDOFST,
++		    ISPCCDC_SDOFST_LOFST_MASK << ISPCCDC_SDOFST_LOFST2_SHIFT);
++	isp_reg_clr(isp, OMAP3_ISP_IOMEM_CCDC, ISPCCDC_SDOFST,
++		    ISPCCDC_SDOFST_LOFST_MASK << ISPCCDC_SDOFST_LOFST3_SHIFT);
++
++	/* In case of BT656 each alternate line must be stored into memory */
++	if (pdata->bt656) {
++		ccdc_config_outlineoffset(ccdc, pix.bytesperline, EVENEVEN, 1);
++		ccdc_config_outlineoffset(ccdc, pix.bytesperline, EVENODD, 1);
++		ccdc_config_outlineoffset(ccdc, pix.bytesperline, ODDEVEN, 1);
++		ccdc_config_outlineoffset(ccdc, pix.bytesperline, ODDODD, 1);
++                isp_reg_set(isp, OMAP3_ISP_IOMEM_CCDC, ISPCCDC_SDOFST,
++                            ISPCCDC_SDOFST_FINV);
++	} else {
++		ccdc_config_outlineoffset(ccdc, ccdc->video_out.bpl_value, 0, 0);
++	}
++
++	/* The CCDC outputs data in UYVY order by default. Swap bytes to get
++	 * YUYV.
++	 */
++	if (format->code == V4L2_MBUS_FMT_YUYV8_1X16)
++		isp_reg_set(isp, OMAP3_ISP_IOMEM_CCDC, ISPCCDC_CFG,
++			    ISPCCDC_CFG_BSWD);
++	else
++		isp_reg_clr(isp, OMAP3_ISP_IOMEM_CCDC, ISPCCDC_CFG,
++			    ISPCCDC_CFG_BSWD);
++
++	/* Use PACK8 mode for 1byte per pixel formats. */
++	if (omap3isp_video_format_info(format->code)->width <= 8)
++		syn_mode |= ISPCCDC_SYN_MODE_PACK8;
++	else
++		syn_mode &= ~ISPCCDC_SYN_MODE_PACK8;
++
++	isp_reg_writel(isp, syn_mode, OMAP3_ISP_IOMEM_CCDC, ISPCCDC_SYN_MODE);
+ 
+ 	/* CCDC_PAD_SOURCE_VP */
+ 	format = &ccdc->formats[CCDC_PAD_SOURCE_VP];
+@@ -1242,6 +1315,7 @@
+ 		       (format->height << ISPCCDC_VP_OUT_VERT_NUM_SHIFT),
+ 		       OMAP3_ISP_IOMEM_CCDC, ISPCCDC_VP_OUT);
+ 
++	/* Lens shading correction. */
+ 	spin_lock_irqsave(&ccdc->lsc.req_lock, flags);
+ 	if (ccdc->lsc.request == NULL)
+ 		goto unlock;
+@@ -1264,6 +1338,11 @@
+ unlock:
+ 	spin_unlock_irqrestore(&ccdc->lsc.req_lock, flags);
+ 
++	if (pdata->bt656)
++		ccdc->update = OMAP3ISP_CCDC_BLCLAMP;
++	else
++		ccdc->update = 0;
++
+ 	ccdc_apply_controls(ccdc);
+ }
+ 
+@@ -1275,6 +1354,7 @@
+ 			ISPCCDC_PCR_EN, enable ? ISPCCDC_PCR_EN : 0);
+ }
+ 
++static int __ccdc_handle_stopping(struct isp_ccdc_device *ccdc, u32 event);
+ static int ccdc_disable(struct isp_ccdc_device *ccdc)
+ {
+ 	unsigned long flags;
+@@ -1285,6 +1365,11 @@
+ 		ccdc->stopping = CCDC_STOP_REQUEST;
+ 	spin_unlock_irqrestore(&ccdc->lock, flags);
+ 
++	__ccdc_lsc_enable(ccdc, 0);
++	__ccdc_enable(ccdc, 0);
++	ccdc->stopping = CCDC_STOP_EXECUTED;
++	__ccdc_handle_stopping(ccdc, CCDC_STOP_FINISHED);
++
+ 	ret = wait_event_timeout(ccdc->wait,
+ 				 ccdc->stopping == CCDC_STOP_FINISHED,
+ 				 msecs_to_jiffies(2000));
+@@ -1540,10 +1625,31 @@
+ {
+ 	unsigned long flags;
+ 	int restart = 0;
++	struct isp_device *isp = to_isp_device(ccdc);
+ 
+-	if (ccdc->output & CCDC_OUTPUT_MEMORY)
+-		restart = ccdc_isr_buffer(ccdc);
+-
++       if (ccdc->output & CCDC_OUTPUT_MEMORY) {
++               if (ccdc_input_is_bt656(ccdc)) {
++                       u32 fid;
++                       u32 syn_mode = isp_reg_readl(isp, OMAP3_ISP_IOMEM_CCDC,
++                                       ISPCCDC_SYN_MODE);
++
++                       fid = (syn_mode & ISPCCDC_SYN_MODE_FLDSTAT) == 0;
++                       /* toggle the software maintained fid */
++                       ccdc->fldstat ^= 1;
++
++                       if (fid == ccdc->fldstat) {
++                               if (fid == 0) {
++                                       restart = ccdc_isr_buffer(ccdc);
++                                       goto done;
++                               }
++                       } else if (fid == 0) {
++                               ccdc->fldstat = fid;
++                       }
++               } else {
++                       restart = ccdc_isr_buffer(ccdc);
++               }
++       }
++done:
+ 	spin_lock_irqsave(&ccdc->lock, flags);
+ 	if (__ccdc_handle_stopping(ccdc, CCDC_EVENT_VD0)) {
+ 		spin_unlock_irqrestore(&ccdc->lock, flags);
+@@ -1629,7 +1735,8 @@
+ 	if (ccdc->state == ISP_PIPELINE_STREAM_STOPPED)
+ 		return 0;
+ 
+-	if (events & IRQ0STATUS_CCDC_VD1_IRQ)
++	if (!ccdc_input_is_bt656(ccdc) &&
++            (events & IRQ0STATUS_CCDC_VD1_IRQ))
+ 		ccdc_vd1_isr(ccdc);
+ 
+ 	ccdc_lsc_isr(ccdc, events);
+@@ -1637,7 +1744,8 @@
+ 	if (events & IRQ0STATUS_CCDC_VD0_IRQ)
+ 		ccdc_vd0_isr(ccdc);
+ 
+-	if (events & IRQ0STATUS_HS_VS_IRQ)
++	if (!ccdc_input_is_bt656(ccdc) &&
++            (events & IRQ0STATUS_HS_VS_IRQ))
+ 		ccdc_hs_vs_isr(ccdc);
+ 
+ 	return 0;
+@@ -1751,7 +1859,7 @@
+ 		 * links are inactive.
+ 		 */
+ 		ccdc_config_vp(ccdc);
+-		ccdc_enable_vp(ccdc, 1);
++		ccdc_enable_vp(ccdc, 0);
+ 		ccdc_print_status(ccdc);
+ 	}
+ 
+@@ -1807,6 +1915,23 @@
+ 		return &ccdc->crop;
+ }
+ 
++static bool ccdc_input_is_bt656(struct isp_ccdc_device *ccdc)
++{
++	const struct isp_parallel_platform_data *pdata = NULL;
++	const struct v4l2_subdev *sensor;
++	const struct media_pad *pad;
++
++	if (ccdc->input != CCDC_INPUT_PARALLEL)
++		return false;
++
++	pad = media_entity_remote_source(&ccdc->pads[CCDC_PAD_SINK]);
++	sensor = media_entity_to_v4l2_subdev(pad->entity);
++	pdata = &((struct isp_v4l2_subdevs_group *)sensor->host_priv)
++		->bus.parallel;
++
++	return pdata && pdata->bt656;
++}
++
+ /*
+  * ccdc_try_format - Try video format on a pad
+  * @ccdc: ISP CCDC device
+@@ -1819,8 +1944,8 @@
+ 		unsigned int pad, struct v4l2_mbus_framefmt *fmt,
+ 		enum v4l2_subdev_format_whence which)
+ {
+-	struct v4l2_mbus_framefmt *format;
+ 	const struct isp_format_info *info;
++	enum v4l2_mbus_pixelcode pixelcode;
+ 	unsigned int width = fmt->width;
+ 	unsigned int height = fmt->height;
+ 	struct v4l2_rect *crop;
+@@ -1828,9 +1953,6 @@
+ 
+ 	switch (pad) {
+ 	case CCDC_PAD_SINK:
+-		/* TODO: If the CCDC output formatter pad is connected directly
+-		 * to the resizer, only YUV formats can be used.
+-		 */
+ 		for (i = 0; i < ARRAY_SIZE(ccdc_fmts); i++) {
+ 			if (fmt->code == ccdc_fmts[i])
+ 				break;
+@@ -1846,8 +1968,27 @@
+ 		break;
+ 
+ 	case CCDC_PAD_SOURCE_OF:
+-		format = __ccdc_get_format(ccdc, fh, CCDC_PAD_SINK, which);
+-		memcpy(fmt, format, sizeof(*fmt));
++		pixelcode = fmt->code;
++		*fmt = *__ccdc_get_format(ccdc, fh, CCDC_PAD_SINK, which);
++
++		/* In non-BT.656 mode, YUV formats are converted from 2X8 to
++		 * 1X16 by the bridge and can be byte-swapped.
++		 */
++		if (!ccdc_input_is_bt656(ccdc) &&
++		    (fmt->code == V4L2_MBUS_FMT_YUYV8_2X8 ||
++		     fmt->code == V4L2_MBUS_FMT_UYVY8_2X8)) {
++			/* Use the user requested format if YUV. */
++			if (pixelcode == V4L2_MBUS_FMT_YUYV8_2X8 ||
++			    pixelcode == V4L2_MBUS_FMT_UYVY8_2X8 ||
++			    pixelcode == V4L2_MBUS_FMT_YUYV8_1X16 ||
++			    pixelcode == V4L2_MBUS_FMT_UYVY8_1X16)
++				fmt->code = pixelcode;
++
++			if (fmt->code == V4L2_MBUS_FMT_YUYV8_2X8)
++				fmt->code = V4L2_MBUS_FMT_YUYV8_1X16;
++			else if (fmt->code == V4L2_MBUS_FMT_UYVY8_2X8)
++				fmt->code = V4L2_MBUS_FMT_UYVY8_1X16;
++		}
+ 
+ 		/* Hardcode the output size to the crop rectangle size. */
+ 		crop = __ccdc_get_crop(ccdc, fh, which);
+@@ -1856,13 +1997,17 @@
+ 		break;
+ 
+ 	case CCDC_PAD_SOURCE_VP:
+-		format = __ccdc_get_format(ccdc, fh, CCDC_PAD_SINK, which);
+-		memcpy(fmt, format, sizeof(*fmt));
++		*fmt = *__ccdc_get_format(ccdc, fh, CCDC_PAD_SINK, which);
+ 
+ 		/* The video port interface truncates the data to 10 bits. */
+ 		info = omap3isp_video_format_info(fmt->code);
+ 		fmt->code = info->truncated;
+ 
++		/* YUV formats are not supported by the video port. */
++		if (fmt->code == V4L2_MBUS_FMT_YUYV8_2X8 ||
++		    fmt->code == V4L2_MBUS_FMT_UYVY8_2X8)
++			fmt->code = 0;
++
+ 		/* The number of lines that can be clocked out from the video
+ 		 * port output must be at least one line less than the number
+ 		 * of input lines.
+@@ -1945,14 +2090,46 @@
+ 		break;
+ 
+ 	case CCDC_PAD_SOURCE_OF:
++		format = __ccdc_get_format(ccdc, fh, code->pad,
++					   V4L2_SUBDEV_FORMAT_TRY);
++
++		if (format->code == V4L2_MBUS_FMT_YUYV8_2X8 ||
++		    format->code == V4L2_MBUS_FMT_UYVY8_2X8) {
++			/* In YUV mode the CCDC can swap bytes. */
++			if (code->index == 0)
++				code->code = V4L2_MBUS_FMT_YUYV8_1X16;
++			else if (code->index == 1)
++				code->code = V4L2_MBUS_FMT_UYVY8_1X16;
++			else
++				return -EINVAL;
++		} else {
++			/* In raw mode, no configurable format confversion is
++			 * available.
++			 */
++			if (code->index == 0)
++				code->code = format->code;
++			else
++				return -EINVAL;
++		}
++		break;
++
+ 	case CCDC_PAD_SOURCE_VP:
+-		/* No format conversion inside CCDC */
++		/* The CCDC supports no configurable format conversion
++		 * compatible with the video port. Enumerate a single output
++		 * format code.
++		 */
+ 		if (code->index != 0)
+ 			return -EINVAL;
+ 
+-		format = __ccdc_get_format(ccdc, fh, CCDC_PAD_SINK,
++		format = __ccdc_get_format(ccdc, fh, code->pad,
+ 					   V4L2_SUBDEV_FORMAT_TRY);
+ 
++		/* A pixel code equal to 0 means that the video port doesn't
++		 * support the input format. Don't enumerate any pixel code.
++		 */
++		if (format->code == 0)
++			return -EINVAL;
++
+ 		code->code = format->code;
+ 		break;
+ 
+@@ -2182,7 +2359,7 @@
+ 	if (in_info->flavor != out_info->flavor)
+ 		return false;
+ 
+-	return in_info->bpp - out_info->bpp + additional_shift <= 6;
++	return in_info->width - out_info->width + additional_shift <= 6;
+ }
+ 
+ static int ccdc_link_validate(struct v4l2_subdev *sd,
+@@ -2487,18 +2664,10 @@
+ 	INIT_LIST_HEAD(&ccdc->lsc.free_queue);
+ 	spin_lock_init(&ccdc->lsc.req_lock);
+ 
+-	ccdc->syncif.ccdc_mastermode = 0;
+-	ccdc->syncif.datapol = 0;
+-	ccdc->syncif.datsz = 0;
+-	ccdc->syncif.fldmode = 0;
+-	ccdc->syncif.fldout = 0;
+-	ccdc->syncif.fldpol = 0;
+-	ccdc->syncif.fldstat = 0;
+-
+ 	ccdc->clamp.oblen = 0;
+ 	ccdc->clamp.dcsubval = 0;
+ 
+-	ccdc->update = OMAP3ISP_CCDC_BLCLAMP;
++	ccdc->update = 0;
+ 	ccdc_apply_controls(ccdc);
+ 
+ 	ret = ccdc_init_entities(ccdc);
+Index: git/drivers/media/video/omap3isp/ispccdc.h
+===================================================================
+--- git.orig/drivers/media/video/omap3isp/ispccdc.h	2012-10-23 10:10:18.815169503 -0500
++++ git/drivers/media/video/omap3isp/ispccdc.h	2012-10-23 10:10:28.055169309 -0500
+@@ -46,40 +46,6 @@
+ 
+ #define	OMAP3ISP_CCDC_NEVENTS	16
+ 
+-/*
+- * struct ispccdc_syncif - Structure for Sync Interface between sensor and CCDC
+- * @ccdc_mastermode: Master mode. 1 - Master, 0 - Slave.
+- * @fldstat: Field state. 0 - Odd Field, 1 - Even Field.
+- * @datsz: Data size.
+- * @fldmode: 0 - Progressive, 1 - Interlaced.
+- * @datapol: 0 - Positive, 1 - Negative.
+- * @fldpol: 0 - Positive, 1 - Negative.
+- * @hdpol: 0 - Positive, 1 - Negative.
+- * @vdpol: 0 - Positive, 1 - Negative.
+- * @fldout: 0 - Input, 1 - Output.
+- * @hs_width: Width of the Horizontal Sync pulse, used for HS/VS Output.
+- * @vs_width: Width of the Vertical Sync pulse, used for HS/VS Output.
+- * @ppln: Number of pixels per line, used for HS/VS Output.
+- * @hlprf: Number of half lines per frame, used for HS/VS Output.
+- * @bt_r656_en: 1 - Enable ITU-R BT656 mode, 0 - Sync mode.
+- */
+-struct ispccdc_syncif {
+-	u8 ccdc_mastermode;
+-	u8 fldstat;
+-	u8 datsz;
+-	u8 fldmode;
+-	u8 datapol;
+-	u8 fldpol;
+-	u8 hdpol;
+-	u8 vdpol;
+-	u8 fldout;
+-	u8 hs_width;
+-	u8 vs_width;
+-	u8 ppln;
+-	u8 hlprf;
+-	u8 bt_r656_en;
+-};
+-
+ enum ispccdc_lsc_state {
+ 	LSC_STATE_STOPPED = 0,
+ 	LSC_STATE_STOPPING = 1,
+@@ -153,7 +119,6 @@
+  * @lsc: Lens shading compensation configuration
+  * @update: Bitmask of controls to update during the next interrupt
+  * @shadow_update: Controls update in progress by userspace
+- * @syncif: Interface synchronization configuration
+  * @underrun: A buffer underrun occurred and a new buffer has been queued
+  * @state: Streaming state
+  * @lock: Serializes shadow_update with interrupt handler
+@@ -182,9 +147,8 @@
+ 	unsigned int update;
+ 	unsigned int shadow_update;
+ 
+-	struct ispccdc_syncif syncif;
+-
+ 	unsigned int underrun:1;
++	unsigned int fldstat:1;
+ 	enum isp_pipeline_stream_state state;
+ 	spinlock_t lock;
+ 	wait_queue_head_t wait;
+Index: git/drivers/media/video/omap3isp/ispcsi2.c
+===================================================================
+--- git.orig/drivers/media/video/omap3isp/ispcsi2.c	2012-10-23 10:10:18.815169503 -0500
++++ git/drivers/media/video/omap3isp/ispcsi2.c	2012-10-23 10:10:28.055169309 -0500
+@@ -96,11 +96,12 @@
+ 	V4L2_MBUS_FMT_SBGGR10_DPCM8_1X8,
+ 	V4L2_MBUS_FMT_SGBRG10_1X10,
+ 	V4L2_MBUS_FMT_SGBRG10_DPCM8_1X8,
++	V4L2_MBUS_FMT_YUYV8_2X8,
+ };
+ 
+ /* To set the format on the CSI2 requires a mapping function that takes
+  * the following inputs:
+- * - 2 different formats (at this time)
++ * - 3 different formats (at this time)
+  * - 2 destinations (mem, vp+mem) (vp only handled separately)
+  * - 2 decompression options (on, off)
+  * - 2 isp revisions (certain format must be handled differently on OMAP3630)
+@@ -108,7 +109,7 @@
+  * Array indices as follows: [format][dest][decompr][is_3630]
+  * Not all combinations are valid. 0 means invalid.
+  */
+-static const u16 __csi2_fmt_map[2][2][2][2] = {
++static const u16 __csi2_fmt_map[3][2][2][2] = {
+ 	/* RAW10 formats */
+ 	{
+ 		/* Output to memory */
+@@ -147,6 +148,25 @@
+ 			  CSI2_USERDEF_8BIT_DATA1_DPCM10_VP },
+ 		},
+ 	},
++	/* YUYV8 2X8 formats */
++	{
++		/* Output to memory */
++		{
++			/* No DPCM decompression */
++			{ CSI2_PIX_FMT_YUV422_8BIT,
++			  CSI2_PIX_FMT_YUV422_8BIT },
++			/* DPCM decompression */
++			{ 0, 0 },
++		},
++		/* Output to both */
++		{
++			/* No DPCM decompression */
++			{ CSI2_PIX_FMT_YUV422_8BIT_VP,
++			  CSI2_PIX_FMT_YUV422_8BIT_VP },
++			/* DPCM decompression */
++			{ 0, 0 },
++		},
++	},
+ };
+ 
+ /*
+@@ -173,6 +193,9 @@
+ 	case V4L2_MBUS_FMT_SGBRG10_DPCM8_1X8:
+ 		fmtidx = 1;
+ 		break;
++	case V4L2_MBUS_FMT_YUYV8_2X8:
++		fmtidx = 2;
++		break;
+ 	default:
+ 		WARN(1, KERN_ERR "CSI2: pixel format %08x unsupported!\n",
+ 		     fmt->code);
+Index: git/drivers/media/video/omap3isp/isph3a_aewb.c
+===================================================================
+--- git.orig/drivers/media/video/omap3isp/isph3a_aewb.c	2012-10-23 10:10:18.815169503 -0500
++++ git/drivers/media/video/omap3isp/isph3a_aewb.c	2012-10-23 10:10:28.055169309 -0500
+@@ -93,17 +93,11 @@
+ 	if (enable) {
+ 		isp_reg_set(aewb->isp, OMAP3_ISP_IOMEM_H3A, ISPH3A_PCR,
+ 			    ISPH3A_PCR_AEW_EN);
+-		/* This bit is already set if AF is enabled */
+-		if (aewb->isp->isp_af.state != ISPSTAT_ENABLED)
+-			isp_reg_set(aewb->isp, OMAP3_ISP_IOMEM_MAIN, ISP_CTRL,
+-				    ISPCTRL_H3A_CLK_EN);
++		omap3isp_subclk_enable(aewb->isp, OMAP3_ISP_SUBCLK_AEWB);
+ 	} else {
+ 		isp_reg_clr(aewb->isp, OMAP3_ISP_IOMEM_H3A, ISPH3A_PCR,
+ 			    ISPH3A_PCR_AEW_EN);
+-		/* This bit can't be cleared if AF is enabled */
+-		if (aewb->isp->isp_af.state != ISPSTAT_ENABLED)
+-			isp_reg_clr(aewb->isp, OMAP3_ISP_IOMEM_MAIN, ISP_CTRL,
+-				    ISPCTRL_H3A_CLK_EN);
++		omap3isp_subclk_disable(aewb->isp, OMAP3_ISP_SUBCLK_AEWB);
+ 	}
+ }
+ 
+Index: git/drivers/media/video/omap3isp/isph3a_af.c
+===================================================================
+--- git.orig/drivers/media/video/omap3isp/isph3a_af.c	2012-10-23 10:10:18.815169503 -0500
++++ git/drivers/media/video/omap3isp/isph3a_af.c	2012-10-23 10:10:28.059169309 -0500
+@@ -143,17 +143,11 @@
+ 	if (enable) {
+ 		isp_reg_set(af->isp, OMAP3_ISP_IOMEM_H3A, ISPH3A_PCR,
+ 			    ISPH3A_PCR_AF_EN);
+-		/* This bit is already set if AEWB is enabled */
+-		if (af->isp->isp_aewb.state != ISPSTAT_ENABLED)
+-			isp_reg_set(af->isp, OMAP3_ISP_IOMEM_MAIN, ISP_CTRL,
+-				    ISPCTRL_H3A_CLK_EN);
++		omap3isp_subclk_enable(af->isp, OMAP3_ISP_SUBCLK_AF);
+ 	} else {
+ 		isp_reg_clr(af->isp, OMAP3_ISP_IOMEM_H3A, ISPH3A_PCR,
+ 			    ISPH3A_PCR_AF_EN);
+-		/* This bit can't be cleared if AEWB is enabled */
+-		if (af->isp->isp_aewb.state != ISPSTAT_ENABLED)
+-			isp_reg_clr(af->isp, OMAP3_ISP_IOMEM_MAIN, ISP_CTRL,
+-				    ISPCTRL_H3A_CLK_EN);
++		omap3isp_subclk_disable(af->isp, OMAP3_ISP_SUBCLK_AF);
+ 	}
+ }
+ 
+Index: git/drivers/media/video/omap3isp/isphist.c
+===================================================================
+--- git.orig/drivers/media/video/omap3isp/isphist.c	2012-10-23 10:10:18.815169503 -0500
++++ git/drivers/media/video/omap3isp/isphist.c	2012-10-23 10:10:28.059169309 -0500
+@@ -167,13 +167,11 @@
+ 	if (enable) {
+ 		isp_reg_set(hist->isp, OMAP3_ISP_IOMEM_HIST, ISPHIST_PCR,
+ 			    ISPHIST_PCR_ENABLE);
+-		isp_reg_set(hist->isp, OMAP3_ISP_IOMEM_MAIN, ISP_CTRL,
+-			    ISPCTRL_HIST_CLK_EN);
++		omap3isp_subclk_enable(hist->isp, OMAP3_ISP_SUBCLK_HIST);
+ 	} else {
+ 		isp_reg_clr(hist->isp, OMAP3_ISP_IOMEM_HIST, ISPHIST_PCR,
+ 			    ISPHIST_PCR_ENABLE);
+-		isp_reg_clr(hist->isp, OMAP3_ISP_IOMEM_MAIN, ISP_CTRL,
+-			    ISPCTRL_HIST_CLK_EN);
++		omap3isp_subclk_disable(hist->isp, OMAP3_ISP_SUBCLK_HIST);
+ 	}
+ }
+ 
+Index: git/drivers/media/video/omap3isp/isppreview.c
+===================================================================
+--- git.orig/drivers/media/video/omap3isp/isppreview.c	2012-10-23 10:10:18.815169503 -0500
++++ git/drivers/media/video/omap3isp/isppreview.c	2012-10-23 10:10:28.059169309 -0500
+@@ -157,85 +157,74 @@
+ };
+ 
+ /*
+- * preview_enable_invalaw - Enable/Disable Inverse A-Law module in Preview.
+- * @enable: 1 - Reverse the A-Law done in CCDC.
++ * preview_config_luma_enhancement - Configure the Luminance Enhancement table
+  */
+ static void
+-preview_enable_invalaw(struct isp_prev_device *prev, u8 enable)
++preview_config_luma_enhancement(struct isp_prev_device *prev,
++				const struct prev_params *params)
+ {
+ 	struct isp_device *isp = to_isp_device(prev);
++	const struct omap3isp_prev_luma *yt = &params->luma;
++	unsigned int i;
+ 
+-	if (enable)
+-		isp_reg_set(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_PCR,
+-			    ISPPRV_PCR_WIDTH | ISPPRV_PCR_INVALAW);
+-	else
+-		isp_reg_clr(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_PCR,
+-			    ISPPRV_PCR_WIDTH | ISPPRV_PCR_INVALAW);
++	isp_reg_writel(isp, ISPPRV_YENH_TABLE_ADDR,
++		       OMAP3_ISP_IOMEM_PREV, ISPPRV_SET_TBL_ADDR);
++	for (i = 0; i < OMAP3ISP_PREV_YENH_TBL_SIZE; i++) {
++		isp_reg_writel(isp, yt->table[i],
++			       OMAP3_ISP_IOMEM_PREV, ISPPRV_SET_TBL_DATA);
++	}
+ }
+ 
+ /*
+- * preview_enable_drkframe_capture - Enable/Disable of the darkframe capture.
+- * @prev -
+- * @enable: 1 - Enable, 0 - Disable
+- *
+- * NOTE: PRV_WSDR_ADDR and PRV_WADD_OFFSET must be set also
+- * The process is applied for each captured frame.
++ * preview_enable_luma_enhancement - Enable/disable Luminance Enhancement
+  */
+ static void
+-preview_enable_drkframe_capture(struct isp_prev_device *prev, u8 enable)
++preview_enable_luma_enhancement(struct isp_prev_device *prev, bool enable)
+ {
+ 	struct isp_device *isp = to_isp_device(prev);
+ 
+ 	if (enable)
+ 		isp_reg_set(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_PCR,
+-			    ISPPRV_PCR_DRKFCAP);
++			    ISPPRV_PCR_YNENHEN);
+ 	else
+ 		isp_reg_clr(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_PCR,
+-			    ISPPRV_PCR_DRKFCAP);
++			    ISPPRV_PCR_YNENHEN);
+ }
+ 
+ /*
+- * preview_enable_drkframe - Enable/Disable of the darkframe subtract.
+- * @enable: 1 - Acquires memory bandwidth since the pixels in each frame is
+- *          subtracted with the pixels in the current frame.
+- *
+- * The process is applied for each captured frame.
++ * preview_enable_invalaw - Enable/disable Inverse A-Law decompression
+  */
+-static void
+-preview_enable_drkframe(struct isp_prev_device *prev, u8 enable)
++static void preview_enable_invalaw(struct isp_prev_device *prev, bool enable)
+ {
+ 	struct isp_device *isp = to_isp_device(prev);
+ 
+ 	if (enable)
+ 		isp_reg_set(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_PCR,
+-			    ISPPRV_PCR_DRKFEN);
++			    ISPPRV_PCR_WIDTH | ISPPRV_PCR_INVALAW);
+ 	else
+ 		isp_reg_clr(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_PCR,
+-			    ISPPRV_PCR_DRKFEN);
++			    ISPPRV_PCR_WIDTH | ISPPRV_PCR_INVALAW);
+ }
+ 
+ /*
+- * preview_config_drkf_shadcomp - Configures shift value in shading comp.
+- * @scomp_shtval: 3bit value of shift used in shading compensation.
++ * preview_config_hmed - Configure the Horizontal Median Filter
+  */
+-static void
+-preview_config_drkf_shadcomp(struct isp_prev_device *prev,
+-			     const void *scomp_shtval)
++static void preview_config_hmed(struct isp_prev_device *prev,
++				const struct prev_params *params)
+ {
+ 	struct isp_device *isp = to_isp_device(prev);
+-	const u32 *shtval = scomp_shtval;
++	const struct omap3isp_prev_hmed *hmed = &params->hmed;
+ 
+-	isp_reg_clr_set(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_PCR,
+-			ISPPRV_PCR_SCOMP_SFT_MASK,
+-			*shtval << ISPPRV_PCR_SCOMP_SFT_SHIFT);
++	isp_reg_writel(isp, (hmed->odddist == 1 ? 0 : ISPPRV_HMED_ODDDIST) |
++		       (hmed->evendist == 1 ? 0 : ISPPRV_HMED_EVENDIST) |
++		       (hmed->thres << ISPPRV_HMED_THRESHOLD_SHIFT),
++		       OMAP3_ISP_IOMEM_PREV, ISPPRV_HMED);
+ }
+ 
+ /*
+- * preview_enable_hmed - Enables/Disables of the Horizontal Median Filter.
+- * @enable: 1 - Enables Horizontal Median Filter.
++ * preview_enable_hmed - Enable/disable the Horizontal Median Filter
+  */
+-static void
+-preview_enable_hmed(struct isp_prev_device *prev, u8 enable)
++static void preview_enable_hmed(struct isp_prev_device *prev, bool enable)
+ {
+ 	struct isp_device *isp = to_isp_device(prev);
+ 
+@@ -247,82 +236,30 @@
+ 			    ISPPRV_PCR_HMEDEN);
+ }
+ 
+-/*
+- * preview_config_hmed - Configures the Horizontal Median Filter.
+- * @prev_hmed: Structure containing the odd and even distance between the
+- *             pixels in the image along with the filter threshold.
+- */
+-static void
+-preview_config_hmed(struct isp_prev_device *prev, const void *prev_hmed)
+-{
+-	struct isp_device *isp = to_isp_device(prev);
+-	const struct omap3isp_prev_hmed *hmed = prev_hmed;
+-
+-	isp_reg_writel(isp, (hmed->odddist == 1 ? 0 : ISPPRV_HMED_ODDDIST) |
+-		       (hmed->evendist == 1 ? 0 : ISPPRV_HMED_EVENDIST) |
+-		       (hmed->thres << ISPPRV_HMED_THRESHOLD_SHIFT),
+-		       OMAP3_ISP_IOMEM_PREV, ISPPRV_HMED);
+-}
+-
+-/*
+- * preview_config_noisefilter - Configures the Noise Filter.
+- * @prev_nf: Structure containing the noisefilter table, strength to be used
+- *           for the noise filter and the defect correction enable flag.
+- */
+-static void
+-preview_config_noisefilter(struct isp_prev_device *prev, const void *prev_nf)
+-{
+-	struct isp_device *isp = to_isp_device(prev);
+-	const struct omap3isp_prev_nf *nf = prev_nf;
+-	unsigned int i;
+-
+-	isp_reg_writel(isp, nf->spread, OMAP3_ISP_IOMEM_PREV, ISPPRV_NF);
+-	isp_reg_writel(isp, ISPPRV_NF_TABLE_ADDR,
+-		       OMAP3_ISP_IOMEM_PREV, ISPPRV_SET_TBL_ADDR);
+-	for (i = 0; i < OMAP3ISP_PREV_NF_TBL_SIZE; i++) {
+-		isp_reg_writel(isp, nf->table[i],
+-			       OMAP3_ISP_IOMEM_PREV, ISPPRV_SET_TBL_DATA);
+-	}
+-}
+-
+-/*
+- * preview_config_dcor - Configures the defect correction
+- * @prev_dcor: Structure containing the defect correct thresholds
+- */
+-static void
+-preview_config_dcor(struct isp_prev_device *prev, const void *prev_dcor)
+-{
+-	struct isp_device *isp = to_isp_device(prev);
+-	const struct omap3isp_prev_dcor *dcor = prev_dcor;
+-
+-	isp_reg_writel(isp, dcor->detect_correct[0],
+-		       OMAP3_ISP_IOMEM_PREV, ISPPRV_CDC_THR0);
+-	isp_reg_writel(isp, dcor->detect_correct[1],
+-		       OMAP3_ISP_IOMEM_PREV, ISPPRV_CDC_THR1);
+-	isp_reg_writel(isp, dcor->detect_correct[2],
+-		       OMAP3_ISP_IOMEM_PREV, ISPPRV_CDC_THR2);
+-	isp_reg_writel(isp, dcor->detect_correct[3],
+-		       OMAP3_ISP_IOMEM_PREV, ISPPRV_CDC_THR3);
+-	isp_reg_clr_set(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_PCR,
+-			ISPPRV_PCR_DCCOUP,
+-			dcor->couplet_mode_en ? ISPPRV_PCR_DCCOUP : 0);
+-}
++#define OMAP3ISP_PREV_CFA_BLK_SIZE	(OMAP3ISP_PREV_CFA_TBL_SIZE / 4)
+ 
+ /*
+- * preview_config_cfa - Configures the CFA Interpolation parameters.
+- * @prev_cfa: Structure containing the CFA interpolation table, CFA format
+- *            in the image, vertical and horizontal gradient threshold.
+- */
+-static void
+-preview_config_cfa(struct isp_prev_device *prev, const void *prev_cfa)
+-{
++ * preview_config_cfa - Configure CFA Interpolation for Bayer formats
++ *
++ * The CFA table is organised in four blocks, one per Bayer component. The
++ * hardware expects blocks to follow the Bayer order of the input data, while
++ * the driver stores the table in GRBG order in memory. The blocks need to be
++ * reordered to support non-GRBG Bayer patterns.
++ */
++static void preview_config_cfa(struct isp_prev_device *prev,
++			       const struct prev_params *params)
++{
++	static const unsigned int cfa_coef_order[4][4] = {
++		{ 0, 1, 2, 3 }, /* GRBG */
++		{ 1, 0, 3, 2 }, /* RGGB */
++		{ 2, 3, 0, 1 }, /* BGGR */
++		{ 3, 2, 1, 0 }, /* GBRG */
++	};
++	const unsigned int *order = cfa_coef_order[prev->params.cfa_order];
++	const struct omap3isp_prev_cfa *cfa = &params->cfa;
+ 	struct isp_device *isp = to_isp_device(prev);
+-	const struct omap3isp_prev_cfa *cfa = prev_cfa;
+ 	unsigned int i;
+-
+-	isp_reg_clr_set(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_PCR,
+-			ISPPRV_PCR_CFAFMT_MASK,
+-			cfa->format << ISPPRV_PCR_CFAFMT_SHIFT);
++	unsigned int j;
+ 
+ 	isp_reg_writel(isp,
+ 		(cfa->gradthrs_vert << ISPPRV_CFA_GRADTH_VER_SHIFT) |
+@@ -332,73 +269,25 @@
+ 	isp_reg_writel(isp, ISPPRV_CFA_TABLE_ADDR,
+ 		       OMAP3_ISP_IOMEM_PREV, ISPPRV_SET_TBL_ADDR);
+ 
+-	for (i = 0; i < OMAP3ISP_PREV_CFA_TBL_SIZE; i++) {
+-		isp_reg_writel(isp, cfa->table[i],
+-			       OMAP3_ISP_IOMEM_PREV, ISPPRV_SET_TBL_DATA);
++	for (i = 0; i < 4; ++i) {
++		const __u32 *block = cfa->table
++				   + order[i] * OMAP3ISP_PREV_CFA_BLK_SIZE;
++
++		for (j = 0; j < OMAP3ISP_PREV_CFA_BLK_SIZE; ++j)
++			isp_reg_writel(isp, block[j], OMAP3_ISP_IOMEM_PREV,
++				       ISPPRV_SET_TBL_DATA);
+ 	}
+ }
+ 
+ /*
+- * preview_config_gammacorrn - Configures the Gamma Correction table values
+- * @gtable: Structure containing the table for red, blue, green gamma table.
+- */
+-static void
+-preview_config_gammacorrn(struct isp_prev_device *prev, const void *gtable)
+-{
+-	struct isp_device *isp = to_isp_device(prev);
+-	const struct omap3isp_prev_gtables *gt = gtable;
+-	unsigned int i;
+-
+-	isp_reg_writel(isp, ISPPRV_REDGAMMA_TABLE_ADDR,
+-		       OMAP3_ISP_IOMEM_PREV, ISPPRV_SET_TBL_ADDR);
+-	for (i = 0; i < OMAP3ISP_PREV_GAMMA_TBL_SIZE; i++)
+-		isp_reg_writel(isp, gt->red[i], OMAP3_ISP_IOMEM_PREV,
+-			       ISPPRV_SET_TBL_DATA);
+-
+-	isp_reg_writel(isp, ISPPRV_GREENGAMMA_TABLE_ADDR,
+-		       OMAP3_ISP_IOMEM_PREV, ISPPRV_SET_TBL_ADDR);
+-	for (i = 0; i < OMAP3ISP_PREV_GAMMA_TBL_SIZE; i++)
+-		isp_reg_writel(isp, gt->green[i], OMAP3_ISP_IOMEM_PREV,
+-			       ISPPRV_SET_TBL_DATA);
+-
+-	isp_reg_writel(isp, ISPPRV_BLUEGAMMA_TABLE_ADDR,
+-		       OMAP3_ISP_IOMEM_PREV, ISPPRV_SET_TBL_ADDR);
+-	for (i = 0; i < OMAP3ISP_PREV_GAMMA_TBL_SIZE; i++)
+-		isp_reg_writel(isp, gt->blue[i], OMAP3_ISP_IOMEM_PREV,
+-			       ISPPRV_SET_TBL_DATA);
+-}
+-
+-/*
+- * preview_config_luma_enhancement - Sets the Luminance Enhancement table.
+- * @ytable: Structure containing the table for Luminance Enhancement table.
+- */
+-static void
+-preview_config_luma_enhancement(struct isp_prev_device *prev,
+-				const void *ytable)
+-{
+-	struct isp_device *isp = to_isp_device(prev);
+-	const struct omap3isp_prev_luma *yt = ytable;
+-	unsigned int i;
+-
+-	isp_reg_writel(isp, ISPPRV_YENH_TABLE_ADDR,
+-		       OMAP3_ISP_IOMEM_PREV, ISPPRV_SET_TBL_ADDR);
+-	for (i = 0; i < OMAP3ISP_PREV_YENH_TBL_SIZE; i++) {
+-		isp_reg_writel(isp, yt->table[i],
+-			       OMAP3_ISP_IOMEM_PREV, ISPPRV_SET_TBL_DATA);
+-	}
+-}
+-
+-/*
+- * preview_config_chroma_suppression - Configures the Chroma Suppression.
+- * @csup: Structure containing the threshold value for suppression
+- *        and the hypass filter enable flag.
++ * preview_config_chroma_suppression - Configure Chroma Suppression
+  */
+ static void
+ preview_config_chroma_suppression(struct isp_prev_device *prev,
+-				  const void *csup)
++				  const struct prev_params *params)
+ {
+ 	struct isp_device *isp = to_isp_device(prev);
+-	const struct omap3isp_prev_csup *cs = csup;
++	const struct omap3isp_prev_csup *cs = &params->csup;
+ 
+ 	isp_reg_writel(isp,
+ 		       cs->gain | (cs->thres << ISPPRV_CSUP_THRES_SHIFT) |
+@@ -407,80 +296,10 @@
+ }
+ 
+ /*
+- * preview_enable_noisefilter - Enables/Disables the Noise Filter.
+- * @enable: 1 - Enables the Noise Filter.
+- */
+-static void
+-preview_enable_noisefilter(struct isp_prev_device *prev, u8 enable)
+-{
+-	struct isp_device *isp = to_isp_device(prev);
+-
+-	if (enable)
+-		isp_reg_set(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_PCR,
+-			    ISPPRV_PCR_NFEN);
+-	else
+-		isp_reg_clr(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_PCR,
+-			    ISPPRV_PCR_NFEN);
+-}
+-
+-/*
+- * preview_enable_dcor - Enables/Disables the defect correction.
+- * @enable: 1 - Enables the defect correction.
+- */
+-static void
+-preview_enable_dcor(struct isp_prev_device *prev, u8 enable)
+-{
+-	struct isp_device *isp = to_isp_device(prev);
+-
+-	if (enable)
+-		isp_reg_set(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_PCR,
+-			    ISPPRV_PCR_DCOREN);
+-	else
+-		isp_reg_clr(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_PCR,
+-			    ISPPRV_PCR_DCOREN);
+-}
+-
+-/*
+- * preview_enable_gammabypass - Enables/Disables the GammaByPass
+- * @enable: 1 - Bypasses Gamma - 10bit input is cropped to 8MSB.
+- *          0 - Goes through Gamma Correction. input and output is 10bit.
++ * preview_enable_chroma_suppression - Enable/disable Chrominance Suppression
+  */
+ static void
+-preview_enable_gammabypass(struct isp_prev_device *prev, u8 enable)
+-{
+-	struct isp_device *isp = to_isp_device(prev);
+-
+-	if (enable)
+-		isp_reg_set(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_PCR,
+-			    ISPPRV_PCR_GAMMA_BYPASS);
+-	else
+-		isp_reg_clr(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_PCR,
+-			    ISPPRV_PCR_GAMMA_BYPASS);
+-}
+-
+-/*
+- * preview_enable_luma_enhancement - Enables/Disables Luminance Enhancement
+- * @enable: 1 - Enable the Luminance Enhancement.
+- */
+-static void
+-preview_enable_luma_enhancement(struct isp_prev_device *prev, u8 enable)
+-{
+-	struct isp_device *isp = to_isp_device(prev);
+-
+-	if (enable)
+-		isp_reg_set(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_PCR,
+-			    ISPPRV_PCR_YNENHEN);
+-	else
+-		isp_reg_clr(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_PCR,
+-			    ISPPRV_PCR_YNENHEN);
+-}
+-
+-/*
+- * preview_enable_chroma_suppression - Enables/Disables Chrominance Suppr.
+- * @enable: 1 - Enable the Chrominance Suppression.
+- */
+-static void
+-preview_enable_chroma_suppression(struct isp_prev_device *prev, u8 enable)
++preview_enable_chroma_suppression(struct isp_prev_device *prev, bool enable)
+ {
+ 	struct isp_device *isp = to_isp_device(prev);
+ 
+@@ -493,17 +312,16 @@
+ }
+ 
+ /*
+- * preview_config_whitebalance - Configures the White Balance parameters.
+- * @prev_wbal: Structure containing the digital gain and white balance
+- *             coefficient.
++ * preview_config_whitebalance - Configure White Balance parameters
+  *
+  * Coefficient matrix always with default values.
+  */
+ static void
+-preview_config_whitebalance(struct isp_prev_device *prev, const void *prev_wbal)
++preview_config_whitebalance(struct isp_prev_device *prev,
++			    const struct prev_params *params)
+ {
+ 	struct isp_device *isp = to_isp_device(prev);
+-	const struct omap3isp_prev_wbal *wbal = prev_wbal;
++	const struct omap3isp_prev_wbal *wbal = &params->wbal;
+ 	u32 val;
+ 
+ 	isp_reg_writel(isp, wbal->dgain, OMAP3_ISP_IOMEM_PREV, ISPPRV_WB_DGAIN);
+@@ -535,15 +353,14 @@
+ }
+ 
+ /*
+- * preview_config_blkadj - Configures the Black Adjustment parameters.
+- * @prev_blkadj: Structure containing the black adjustment towards red, green,
+- *               blue.
++ * preview_config_blkadj - Configure Black Adjustment
+  */
+ static void
+-preview_config_blkadj(struct isp_prev_device *prev, const void *prev_blkadj)
++preview_config_blkadj(struct isp_prev_device *prev,
++		      const struct prev_params *params)
+ {
+ 	struct isp_device *isp = to_isp_device(prev);
+-	const struct omap3isp_prev_blkadj *blkadj = prev_blkadj;
++	const struct omap3isp_prev_blkadj *blkadj = &params->blkadj;
+ 
+ 	isp_reg_writel(isp, (blkadj->blue << ISPPRV_BLKADJOFF_B_SHIFT) |
+ 		       (blkadj->green << ISPPRV_BLKADJOFF_G_SHIFT) |
+@@ -552,15 +369,14 @@
+ }
+ 
+ /*
+- * preview_config_rgb_blending - Configures the RGB-RGB Blending matrix.
+- * @rgb2rgb: Structure containing the rgb to rgb blending matrix and the rgb
+- *           offset.
++ * preview_config_rgb_blending - Configure RGB-RGB Blending
+  */
+ static void
+-preview_config_rgb_blending(struct isp_prev_device *prev, const void *rgb2rgb)
++preview_config_rgb_blending(struct isp_prev_device *prev,
++			    const struct prev_params *params)
+ {
+ 	struct isp_device *isp = to_isp_device(prev);
+-	const struct omap3isp_prev_rgbtorgb *rgbrgb = rgb2rgb;
++	const struct omap3isp_prev_rgbtorgb *rgbrgb = &params->rgb2rgb;
+ 	u32 val;
+ 
+ 	val = (rgbrgb->matrix[0][0] & 0xfff) << ISPPRV_RGB_MAT1_MTX_RR_SHIFT;
+@@ -591,15 +407,14 @@
+ }
+ 
+ /*
+- * Configures the color space conversion (RGB toYCbYCr) matrix
+- * @prev_csc: Structure containing the RGB to YCbYCr matrix and the
+- *            YCbCr offset.
++ * preview_config_csc - Configure Color Space Conversion (RGB to YCbYCr)
+  */
+ static void
+-preview_config_csc(struct isp_prev_device *prev, const void *prev_csc)
++preview_config_csc(struct isp_prev_device *prev,
++		   const struct prev_params *params)
+ {
+ 	struct isp_device *isp = to_isp_device(prev);
+-	const struct omap3isp_prev_csc *csc = prev_csc;
++	const struct omap3isp_prev_csc *csc = &params->csc;
+ 	u32 val;
+ 
+ 	val = (csc->matrix[0][0] & 0x3ff) << ISPPRV_CSC0_RY_SHIFT;
+@@ -624,6 +439,208 @@
+ }
+ 
+ /*
++ * preview_config_yc_range - Configure the max and min Y and C values
++ */
++static void
++preview_config_yc_range(struct isp_prev_device *prev,
++			const struct prev_params *params)
++{
++	struct isp_device *isp = to_isp_device(prev);
++	const struct omap3isp_prev_yclimit *yc = &params->yclimit;
++
++	isp_reg_writel(isp,
++		       yc->maxC << ISPPRV_SETUP_YC_MAXC_SHIFT |
++		       yc->maxY << ISPPRV_SETUP_YC_MAXY_SHIFT |
++		       yc->minC << ISPPRV_SETUP_YC_MINC_SHIFT |
++		       yc->minY << ISPPRV_SETUP_YC_MINY_SHIFT,
++		       OMAP3_ISP_IOMEM_PREV, ISPPRV_SETUP_YC);
++}
++
++/*
++ * preview_config_dcor - Configure Couplet Defect Correction
++ */
++static void
++preview_config_dcor(struct isp_prev_device *prev,
++		    const struct prev_params *params)
++{
++	struct isp_device *isp = to_isp_device(prev);
++	const struct omap3isp_prev_dcor *dcor = &params->dcor;
++
++	isp_reg_writel(isp, dcor->detect_correct[0],
++		       OMAP3_ISP_IOMEM_PREV, ISPPRV_CDC_THR0);
++	isp_reg_writel(isp, dcor->detect_correct[1],
++		       OMAP3_ISP_IOMEM_PREV, ISPPRV_CDC_THR1);
++	isp_reg_writel(isp, dcor->detect_correct[2],
++		       OMAP3_ISP_IOMEM_PREV, ISPPRV_CDC_THR2);
++	isp_reg_writel(isp, dcor->detect_correct[3],
++		       OMAP3_ISP_IOMEM_PREV, ISPPRV_CDC_THR3);
++	isp_reg_clr_set(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_PCR,
++			ISPPRV_PCR_DCCOUP,
++			dcor->couplet_mode_en ? ISPPRV_PCR_DCCOUP : 0);
++}
++
++/*
++ * preview_enable_dcor - Enable/disable Couplet Defect Correction
++ */
++static void preview_enable_dcor(struct isp_prev_device *prev, bool enable)
++{
++	struct isp_device *isp = to_isp_device(prev);
++
++	if (enable)
++		isp_reg_set(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_PCR,
++			    ISPPRV_PCR_DCOREN);
++	else
++		isp_reg_clr(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_PCR,
++			    ISPPRV_PCR_DCOREN);
++}
++
++/*
++ * preview_enable_drkframe_capture - Enable/disable Dark Frame Capture
++ */
++static void
++preview_enable_drkframe_capture(struct isp_prev_device *prev, bool enable)
++{
++	struct isp_device *isp = to_isp_device(prev);
++
++	if (enable)
++		isp_reg_set(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_PCR,
++			    ISPPRV_PCR_DRKFCAP);
++	else
++		isp_reg_clr(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_PCR,
++			    ISPPRV_PCR_DRKFCAP);
++}
++
++/*
++ * preview_enable_drkframe - Enable/disable Dark Frame Subtraction
++ */
++static void preview_enable_drkframe(struct isp_prev_device *prev, bool enable)
++{
++	struct isp_device *isp = to_isp_device(prev);
++
++	if (enable)
++		isp_reg_set(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_PCR,
++			    ISPPRV_PCR_DRKFEN);
++	else
++		isp_reg_clr(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_PCR,
++			    ISPPRV_PCR_DRKFEN);
++}
++
++/*
++ * preview_config_noisefilter - Configure the Noise Filter
++ */
++static void
++preview_config_noisefilter(struct isp_prev_device *prev,
++			   const struct prev_params *params)
++{
++	struct isp_device *isp = to_isp_device(prev);
++	const struct omap3isp_prev_nf *nf = &params->nf;
++	unsigned int i;
++
++	isp_reg_writel(isp, nf->spread, OMAP3_ISP_IOMEM_PREV, ISPPRV_NF);
++	isp_reg_writel(isp, ISPPRV_NF_TABLE_ADDR,
++		       OMAP3_ISP_IOMEM_PREV, ISPPRV_SET_TBL_ADDR);
++	for (i = 0; i < OMAP3ISP_PREV_NF_TBL_SIZE; i++) {
++		isp_reg_writel(isp, nf->table[i],
++			       OMAP3_ISP_IOMEM_PREV, ISPPRV_SET_TBL_DATA);
++	}
++}
++
++/*
++ * preview_enable_noisefilter - Enable/disable the Noise Filter
++ */
++static void
++preview_enable_noisefilter(struct isp_prev_device *prev, bool enable)
++{
++	struct isp_device *isp = to_isp_device(prev);
++
++	if (enable)
++		isp_reg_set(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_PCR,
++			    ISPPRV_PCR_NFEN);
++	else
++		isp_reg_clr(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_PCR,
++			    ISPPRV_PCR_NFEN);
++}
++
++/*
++ * preview_config_gammacorrn - Configure the Gamma Correction tables
++ */
++static void
++preview_config_gammacorrn(struct isp_prev_device *prev,
++			  const struct prev_params *params)
++{
++	struct isp_device *isp = to_isp_device(prev);
++	const struct omap3isp_prev_gtables *gt = &params->gamma;
++	unsigned int i;
++
++	isp_reg_writel(isp, ISPPRV_REDGAMMA_TABLE_ADDR,
++		       OMAP3_ISP_IOMEM_PREV, ISPPRV_SET_TBL_ADDR);
++	for (i = 0; i < OMAP3ISP_PREV_GAMMA_TBL_SIZE; i++)
++		isp_reg_writel(isp, gt->red[i], OMAP3_ISP_IOMEM_PREV,
++			       ISPPRV_SET_TBL_DATA);
++
++	isp_reg_writel(isp, ISPPRV_GREENGAMMA_TABLE_ADDR,
++		       OMAP3_ISP_IOMEM_PREV, ISPPRV_SET_TBL_ADDR);
++	for (i = 0; i < OMAP3ISP_PREV_GAMMA_TBL_SIZE; i++)
++		isp_reg_writel(isp, gt->green[i], OMAP3_ISP_IOMEM_PREV,
++			       ISPPRV_SET_TBL_DATA);
++
++	isp_reg_writel(isp, ISPPRV_BLUEGAMMA_TABLE_ADDR,
++		       OMAP3_ISP_IOMEM_PREV, ISPPRV_SET_TBL_ADDR);
++	for (i = 0; i < OMAP3ISP_PREV_GAMMA_TBL_SIZE; i++)
++		isp_reg_writel(isp, gt->blue[i], OMAP3_ISP_IOMEM_PREV,
++			       ISPPRV_SET_TBL_DATA);
++}
++
++/*
++ * preview_enable_gammacorrn - Enable/disable Gamma Correction
++ *
++ * When gamma correction is disabled, the module is bypassed and its output is
++ * the 8 MSB of the 10-bit input .
++ */
++static void
++preview_enable_gammacorrn(struct isp_prev_device *prev, bool enable)
++{
++	struct isp_device *isp = to_isp_device(prev);
++
++	if (enable)
++		isp_reg_clr(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_PCR,
++			    ISPPRV_PCR_GAMMA_BYPASS);
++	else
++		isp_reg_set(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_PCR,
++			    ISPPRV_PCR_GAMMA_BYPASS);
++}
++
++/*
++ * preview_config_contrast - Configure the Contrast
++ *
++ * Value should be programmed before enabling the module.
++ */
++static void
++preview_config_contrast(struct isp_prev_device *prev,
++			const struct prev_params *params)
++{
++	struct isp_device *isp = to_isp_device(prev);
++
++	isp_reg_clr_set(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_CNT_BRT,
++			0xff << ISPPRV_CNT_BRT_CNT_SHIFT,
++			params->contrast << ISPPRV_CNT_BRT_CNT_SHIFT);
++}
++
++/*
++ * preview_config_brightness - Configure the Brightness
++ */
++static void
++preview_config_brightness(struct isp_prev_device *prev,
++			  const struct prev_params *params)
++{
++	struct isp_device *isp = to_isp_device(prev);
++
++	isp_reg_clr_set(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_CNT_BRT,
++			0xff << ISPPRV_CNT_BRT_BRT_SHIFT,
++			params->brightness << ISPPRV_CNT_BRT_BRT_SHIFT);
++}
++
++/*
+  * preview_update_contrast - Updates the contrast.
+  * @contrast: Pointer to hold the current programmed contrast value.
+  *
+@@ -647,22 +664,6 @@
+ }
+ 
+ /*
+- * preview_config_contrast - Configures the Contrast.
+- * @params: Contrast value (u8 pointer, U8Q0 format).
+- *
+- * Value should be programmed before enabling the module.
+- */
+-static void
+-preview_config_contrast(struct isp_prev_device *prev, const void *params)
+-{
+-	struct isp_device *isp = to_isp_device(prev);
+-
+-	isp_reg_clr_set(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_CNT_BRT,
+-			0xff << ISPPRV_CNT_BRT_CNT_SHIFT,
+-			*(u8 *)params << ISPPRV_CNT_BRT_CNT_SHIFT);
+-}
+-
+-/*
+  * preview_update_brightness - Updates the brightness in preview module.
+  * @brightness: Pointer to hold the current programmed brightness value.
+  *
+@@ -684,38 +685,6 @@
+ 	spin_unlock_irqrestore(&prev->params.lock, flags);
+ }
+ 
+-/*
+- * preview_config_brightness - Configures the brightness.
+- * @params: Brightness value (u8 pointer, U8Q0 format).
+- */
+-static void
+-preview_config_brightness(struct isp_prev_device *prev, const void *params)
+-{
+-	struct isp_device *isp = to_isp_device(prev);
+-
+-	isp_reg_clr_set(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_CNT_BRT,
+-			0xff << ISPPRV_CNT_BRT_BRT_SHIFT,
+-			*(u8 *)params << ISPPRV_CNT_BRT_BRT_SHIFT);
+-}
+-
+-/*
+- * preview_config_yc_range - Configures the max and min Y and C values.
+- * @yclimit: Structure containing the range of Y and C values.
+- */
+-static void
+-preview_config_yc_range(struct isp_prev_device *prev, const void *yclimit)
+-{
+-	struct isp_device *isp = to_isp_device(prev);
+-	const struct omap3isp_prev_yclimit *yc = yclimit;
+-
+-	isp_reg_writel(isp,
+-		       yc->maxC << ISPPRV_SETUP_YC_MAXC_SHIFT |
+-		       yc->maxY << ISPPRV_SETUP_YC_MAXY_SHIFT |
+-		       yc->minC << ISPPRV_SETUP_YC_MINC_SHIFT |
+-		       yc->minY << ISPPRV_SETUP_YC_MINY_SHIFT,
+-		       OMAP3_ISP_IOMEM_PREV, ISPPRV_SETUP_YC);
+-}
+-
+ static u32
+ preview_params_lock(struct isp_prev_device *prev, u32 update, bool shadow)
+ {
+@@ -787,8 +756,8 @@
+ 
+ /* preview parameters update structure */
+ struct preview_update {
+-	void (*config)(struct isp_prev_device *, const void *);
+-	void (*enable)(struct isp_prev_device *, u8);
++	void (*config)(struct isp_prev_device *, const struct prev_params *);
++	void (*enable)(struct isp_prev_device *, bool);
+ 	unsigned int param_offset;
+ 	unsigned int param_size;
+ 	unsigned int config_offset;
+@@ -862,7 +831,7 @@
+ 		offsetof(struct omap3isp_prev_update_config, dcor),
+ 	}, /* OMAP3ISP_PREV_GAMMABYPASS */ {
+ 		NULL,
+-		preview_enable_gammabypass,
++		NULL,
+ 	}, /* OMAP3ISP_PREV_DRK_FRM_CAPTURE */ {
+ 		NULL,
+ 		preview_enable_drkframe_capture,
+@@ -870,7 +839,7 @@
+ 		NULL,
+ 		preview_enable_drkframe,
+ 	}, /* OMAP3ISP_PREV_LENS_SHADING */ {
+-		preview_config_drkf_shadcomp,
++		NULL,
+ 		preview_enable_drkframe,
+ 	}, /* OMAP3ISP_PREV_NF */ {
+ 		preview_config_noisefilter,
+@@ -880,20 +849,18 @@
+ 		offsetof(struct omap3isp_prev_update_config, nf),
+ 	}, /* OMAP3ISP_PREV_GAMMA */ {
+ 		preview_config_gammacorrn,
+-		NULL,
++		preview_enable_gammacorrn,
+ 		offsetof(struct prev_params, gamma),
+ 		FIELD_SIZEOF(struct prev_params, gamma),
+ 		offsetof(struct omap3isp_prev_update_config, gamma),
+ 	}, /* OMAP3ISP_PREV_CONTRAST */ {
+ 		preview_config_contrast,
+ 		NULL,
+-		offsetof(struct prev_params, contrast),
+-		0, 0, true,
++		0, 0, 0, true,
+ 	}, /* OMAP3ISP_PREV_BRIGHTNESS */ {
+ 		preview_config_brightness,
+ 		NULL,
+-		offsetof(struct prev_params, brightness),
+-		0, 0, true,
++		0, 0, 0, true,
+ 	},
+ };
+ 
+@@ -988,7 +955,6 @@
+ 		const struct preview_update *attr = &update_attrs[i];
+ 		struct prev_params *params;
+ 		unsigned int bit = 1 << i;
+-		void *param_ptr;
+ 
+ 		if (!(update & bit))
+ 			continue;
+@@ -996,15 +962,13 @@
+ 		params = &prev->params.params[!(active & bit)];
+ 
+ 		if (params->features & bit) {
+-			if (attr->config) {
+-				param_ptr = (void *)params + attr->param_offset;
+-				attr->config(prev, param_ptr);
+-			}
++			if (attr->config)
++				attr->config(prev, params);
+ 			if (attr->enable)
+-				attr->enable(prev, 1);
++				attr->enable(prev, true);
+ 		} else {
+ 			if (attr->enable)
+-				attr->enable(prev, 0);
++				attr->enable(prev, false);
+ 		}
+ 	}
+ }
+@@ -1043,42 +1007,62 @@
+ static void preview_config_averager(struct isp_prev_device *prev, u8 average)
+ {
+ 	struct isp_device *isp = to_isp_device(prev);
+-	struct prev_params *params;
+-	int reg = 0;
+ 
+-	params = (prev->params.active & OMAP3ISP_PREV_CFA)
+-	       ? &prev->params.params[0] : &prev->params.params[1];
+-
+-	if (params->cfa.format == OMAP3ISP_CFAFMT_BAYER)
+-		reg = ISPPRV_AVE_EVENDIST_2 << ISPPRV_AVE_EVENDIST_SHIFT |
+-		      ISPPRV_AVE_ODDDIST_2 << ISPPRV_AVE_ODDDIST_SHIFT |
+-		      average;
+-	else if (params->cfa.format == OMAP3ISP_CFAFMT_RGBFOVEON)
+-		reg = ISPPRV_AVE_EVENDIST_3 << ISPPRV_AVE_EVENDIST_SHIFT |
+-		      ISPPRV_AVE_ODDDIST_3 << ISPPRV_AVE_ODDDIST_SHIFT |
+-		      average;
+-	isp_reg_writel(isp, reg, OMAP3_ISP_IOMEM_PREV, ISPPRV_AVE);
++	isp_reg_writel(isp, ISPPRV_AVE_EVENDIST_2 << ISPPRV_AVE_EVENDIST_SHIFT |
++		       ISPPRV_AVE_ODDDIST_2 << ISPPRV_AVE_ODDDIST_SHIFT |
++		       average, OMAP3_ISP_IOMEM_PREV, ISPPRV_AVE);
+ }
+ 
++
++#define OMAP3ISP_PREV_CFA_BLK_SIZE	(OMAP3ISP_PREV_CFA_TBL_SIZE / 4)
++
+ /*
+  * preview_config_input_format - Configure the input format
+  * @prev: The preview engine
+  * @format: Format on the preview engine sink pad
+  *
+- * Enable CFA interpolation for Bayer formats and disable it for greyscale
+- * formats.
++ * Enable and configure CFA interpolation for Bayer formats and disable it for
++ * greyscale formats.
++ *
++ * The CFA table is organised in four blocks, one per Bayer component. The
++ * hardware expects blocks to follow the Bayer order of the input data, while
++ * the driver stores the table in GRBG order in memory. The blocks need to be
++ * reordered to support non-GRBG Bayer patterns.
+  */
+ static void preview_config_input_format(struct isp_prev_device *prev,
+ 					const struct v4l2_mbus_framefmt *format)
+ {
+ 	struct isp_device *isp = to_isp_device(prev);
++	struct prev_params *params;
+ 
+-	if (format->code != V4L2_MBUS_FMT_Y10_1X10)
+-		isp_reg_set(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_PCR,
+-			    ISPPRV_PCR_CFAEN);
+-	else
++	switch (format->code) {
++	case V4L2_MBUS_FMT_SGRBG10_1X10:
++		prev->params.cfa_order = 0;
++		break;
++	case V4L2_MBUS_FMT_SRGGB10_1X10:
++		prev->params.cfa_order = 1;
++		break;
++	case V4L2_MBUS_FMT_SBGGR10_1X10:
++		prev->params.cfa_order = 2;
++		break;
++	case V4L2_MBUS_FMT_SGBRG10_1X10:
++		prev->params.cfa_order = 3;
++		break;
++	default:
++		/* Disable CFA for non-Bayer formats. */
+ 		isp_reg_clr(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_PCR,
+ 			    ISPPRV_PCR_CFAEN);
++		return;
++	}
++
++	isp_reg_set(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_PCR, ISPPRV_PCR_CFAEN);
++	isp_reg_clr_set(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_PCR,
++			ISPPRV_PCR_CFAFMT_MASK, ISPPRV_PCR_CFAFMT_BAYER);
++
++	params = (prev->params.active & OMAP3ISP_PREV_CFA)
++	       ? &prev->params.params[0] : &prev->params.params[1];
++
++	preview_config_cfa(prev, params);
+ }
+ 
+ /*
+@@ -1102,7 +1086,7 @@
+ 	unsigned int elv = prev->crop.top + prev->crop.height - 1;
+ 	u32 features;
+ 
+-	if (format->code != V4L2_MBUS_FMT_Y10_1X10) {
++	if (format->code == V4L2_MBUS_FMT_Y10_1X10) {
+ 		sph -= 2;
+ 		eph += 2;
+ 		slv -= 2;
+@@ -1421,22 +1405,6 @@
+ 	active = prev->params.active;
+ 	spin_unlock_irqrestore(&prev->params.lock, flags);
+ 
+-	preview_setup_hw(prev, update, active);
+-
+-	if (prev->output & PREVIEW_OUTPUT_MEMORY)
+-		isp_reg_set(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_PCR,
+-			    ISPPRV_PCR_SDRPORT);
+-	else
+-		isp_reg_clr(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_PCR,
+-			    ISPPRV_PCR_SDRPORT);
+-
+-	if (prev->output & PREVIEW_OUTPUT_RESIZER)
+-		isp_reg_set(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_PCR,
+-			    ISPPRV_PCR_RSZPORT);
+-	else
+-		isp_reg_clr(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_PCR,
+-			    ISPPRV_PCR_RSZPORT);
+-
+ 	/* PREV_PAD_SINK */
+ 	format = &prev->formats[PREV_PAD_SINK];
+ 
+@@ -1451,10 +1419,26 @@
+ 		preview_config_inlineoffset(prev,
+ 				ALIGN(format->width, 0x20) * 2);
+ 
++	preview_setup_hw(prev, update, active);
++
+ 	/* PREV_PAD_SOURCE */
+ 	format = &prev->formats[PREV_PAD_SOURCE];
+ 
+ 	if (prev->output & PREVIEW_OUTPUT_MEMORY)
++		isp_reg_set(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_PCR,
++			    ISPPRV_PCR_SDRPORT);
++	else
++		isp_reg_clr(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_PCR,
++			    ISPPRV_PCR_SDRPORT);
++
++	if (prev->output & PREVIEW_OUTPUT_RESIZER)
++		isp_reg_set(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_PCR,
++			    ISPPRV_PCR_RSZPORT);
++	else
++		isp_reg_clr(isp, OMAP3_ISP_IOMEM_PREV, ISPPRV_PCR,
++			    ISPPRV_PCR_RSZPORT);
++
++	if (prev->output & PREVIEW_OUTPUT_MEMORY)
+ 		preview_config_outlineoffset(prev,
+ 				ALIGN(format->width, 0x10) * 2);
+ 
+Index: git/drivers/media/video/omap3isp/isppreview.h
+===================================================================
+--- git.orig/drivers/media/video/omap3isp/isppreview.h	2012-10-23 10:10:18.815169503 -0500
++++ git/drivers/media/video/omap3isp/isppreview.h	2012-10-23 10:10:28.063169309 -0500
+@@ -144,6 +144,7 @@
+ 	struct isp_video video_out;
+ 
+ 	struct {
++		unsigned int cfa_order;
+ 		struct prev_params params[2];
+ 		u32 active;
+ 		spinlock_t lock;
+Index: git/drivers/media/video/omap3isp/ispqueue.c
+===================================================================
+--- git.orig/drivers/media/video/omap3isp/ispqueue.c	2012-10-23 10:10:18.815169503 -0500
++++ git/drivers/media/video/omap3isp/ispqueue.c	2012-10-23 10:10:28.063169309 -0500
+@@ -908,13 +908,14 @@
+  *
+  * This function is intended to be used as a VIDIOC_DQBUF ioctl handler.
+  *
+- * The v4l2_buffer structure passed from userspace is first sanity tested. If
+- * sane, the buffer is then processed and added to the main queue and, if the
+- * queue is streaming, to the IRQ queue.
++ * Wait until a buffer is ready to be dequeued, remove it from the queue and
++ * copy its information to the v4l2_buffer structure.
+  *
+- * Before being enqueued, USERPTR buffers are checked for address changes. If
+- * the buffer has a different userspace address, the old memory area is unlocked
+- * and the new memory area is locked.
++ * If the nonblocking argument is not zero and no buffer is ready, return
++ * -EAGAIN immediately instead of waiting.
++ *
++ * If no buffer has been enqueued, or if the requested buffer type doesn't match
++ * the queue type, return -EINVAL.
+  */
+ int omap3isp_video_queue_dqbuf(struct isp_video_queue *queue,
+ 			       struct v4l2_buffer *vbuf, int nonblocking)
+Index: git/drivers/media/video/omap3isp/ispreg.h
+===================================================================
+--- git.orig/drivers/media/video/omap3isp/ispreg.h	2012-10-23 10:10:18.815169503 -0500
++++ git/drivers/media/video/omap3isp/ispreg.h	2012-10-23 10:10:28.063169309 -0500
+@@ -824,6 +824,7 @@
+ #define ISPCCDC_SDOFST_LOFST2_SHIFT		3
+ #define ISPCCDC_SDOFST_LOFST1_SHIFT		6
+ #define ISPCCDC_SDOFST_LOFST0_SHIFT		9
++#define ISPCCDC_SDOFST_LOFST_MASK               0x7
+ #define EVENEVEN				1
+ #define ODDEVEN					2
+ #define EVENODD					3
+Index: git/drivers/media/video/omap3isp/ispvideo.c
+===================================================================
+--- git.orig/drivers/media/video/omap3isp/ispvideo.c	2012-10-23 10:10:18.819169503 -0500
++++ git/drivers/media/video/omap3isp/ispvideo.c	2012-10-23 10:10:28.063169309 -0500
+@@ -53,67 +53,77 @@
+ static struct isp_format_info formats[] = {
+ 	{ V4L2_MBUS_FMT_Y8_1X8, V4L2_MBUS_FMT_Y8_1X8,
+ 	  V4L2_MBUS_FMT_Y8_1X8, V4L2_MBUS_FMT_Y8_1X8,
+-	  V4L2_PIX_FMT_GREY, 8, },
++	  V4L2_PIX_FMT_GREY, 8, 1, },
+ 	{ V4L2_MBUS_FMT_Y10_1X10, V4L2_MBUS_FMT_Y10_1X10,
+ 	  V4L2_MBUS_FMT_Y10_1X10, V4L2_MBUS_FMT_Y8_1X8,
+-	  V4L2_PIX_FMT_Y10, 10, },
++	  V4L2_PIX_FMT_Y10, 10, 2, },
+ 	{ V4L2_MBUS_FMT_Y12_1X12, V4L2_MBUS_FMT_Y10_1X10,
+ 	  V4L2_MBUS_FMT_Y12_1X12, V4L2_MBUS_FMT_Y8_1X8,
+-	  V4L2_PIX_FMT_Y12, 12, },
++	  V4L2_PIX_FMT_Y12, 12, 2, },
+ 	{ V4L2_MBUS_FMT_SBGGR8_1X8, V4L2_MBUS_FMT_SBGGR8_1X8,
+ 	  V4L2_MBUS_FMT_SBGGR8_1X8, V4L2_MBUS_FMT_SBGGR8_1X8,
+-	  V4L2_PIX_FMT_SBGGR8, 8, },
++	  V4L2_PIX_FMT_SBGGR8, 8, 1, },
+ 	{ V4L2_MBUS_FMT_SGBRG8_1X8, V4L2_MBUS_FMT_SGBRG8_1X8,
+ 	  V4L2_MBUS_FMT_SGBRG8_1X8, V4L2_MBUS_FMT_SGBRG8_1X8,
+-	  V4L2_PIX_FMT_SGBRG8, 8, },
++	  V4L2_PIX_FMT_SGBRG8, 8, 1, },
+ 	{ V4L2_MBUS_FMT_SGRBG8_1X8, V4L2_MBUS_FMT_SGRBG8_1X8,
+ 	  V4L2_MBUS_FMT_SGRBG8_1X8, V4L2_MBUS_FMT_SGRBG8_1X8,
+-	  V4L2_PIX_FMT_SGRBG8, 8, },
++	  V4L2_PIX_FMT_SGRBG8, 8, 1, },
+ 	{ V4L2_MBUS_FMT_SRGGB8_1X8, V4L2_MBUS_FMT_SRGGB8_1X8,
+ 	  V4L2_MBUS_FMT_SRGGB8_1X8, V4L2_MBUS_FMT_SRGGB8_1X8,
+-	  V4L2_PIX_FMT_SRGGB8, 8, },
++	  V4L2_PIX_FMT_SRGGB8, 8, 1, },
+ 	{ V4L2_MBUS_FMT_SBGGR10_DPCM8_1X8, V4L2_MBUS_FMT_SBGGR10_DPCM8_1X8,
+ 	  V4L2_MBUS_FMT_SBGGR10_1X10, 0,
+-	  V4L2_PIX_FMT_SBGGR10DPCM8, 8, },
++	  V4L2_PIX_FMT_SBGGR10DPCM8, 8, 1, },
+ 	{ V4L2_MBUS_FMT_SGBRG10_DPCM8_1X8, V4L2_MBUS_FMT_SGBRG10_DPCM8_1X8,
+ 	  V4L2_MBUS_FMT_SGBRG10_1X10, 0,
+-	  V4L2_PIX_FMT_SGBRG10DPCM8, 8, },
++	  V4L2_PIX_FMT_SGBRG10DPCM8, 8, 1, },
+ 	{ V4L2_MBUS_FMT_SGRBG10_DPCM8_1X8, V4L2_MBUS_FMT_SGRBG10_DPCM8_1X8,
+ 	  V4L2_MBUS_FMT_SGRBG10_1X10, 0,
+-	  V4L2_PIX_FMT_SGRBG10DPCM8, 8, },
++	  V4L2_PIX_FMT_SGRBG10DPCM8, 8, 1, },
+ 	{ V4L2_MBUS_FMT_SRGGB10_DPCM8_1X8, V4L2_MBUS_FMT_SRGGB10_DPCM8_1X8,
+ 	  V4L2_MBUS_FMT_SRGGB10_1X10, 0,
+-	  V4L2_PIX_FMT_SRGGB10DPCM8, 8, },
++	  V4L2_PIX_FMT_SRGGB10DPCM8, 8, 1, },
+ 	{ V4L2_MBUS_FMT_SBGGR10_1X10, V4L2_MBUS_FMT_SBGGR10_1X10,
+ 	  V4L2_MBUS_FMT_SBGGR10_1X10, V4L2_MBUS_FMT_SBGGR8_1X8,
+-	  V4L2_PIX_FMT_SBGGR10, 10, },
++	  V4L2_PIX_FMT_SBGGR10, 10, 2, },
+ 	{ V4L2_MBUS_FMT_SGBRG10_1X10, V4L2_MBUS_FMT_SGBRG10_1X10,
+ 	  V4L2_MBUS_FMT_SGBRG10_1X10, V4L2_MBUS_FMT_SGBRG8_1X8,
+-	  V4L2_PIX_FMT_SGBRG10, 10, },
++	  V4L2_PIX_FMT_SGBRG10, 10, 2, },
+ 	{ V4L2_MBUS_FMT_SGRBG10_1X10, V4L2_MBUS_FMT_SGRBG10_1X10,
+ 	  V4L2_MBUS_FMT_SGRBG10_1X10, V4L2_MBUS_FMT_SGRBG8_1X8,
+-	  V4L2_PIX_FMT_SGRBG10, 10, },
++	  V4L2_PIX_FMT_SGRBG10, 10, 2, },
+ 	{ V4L2_MBUS_FMT_SRGGB10_1X10, V4L2_MBUS_FMT_SRGGB10_1X10,
+ 	  V4L2_MBUS_FMT_SRGGB10_1X10, V4L2_MBUS_FMT_SRGGB8_1X8,
+-	  V4L2_PIX_FMT_SRGGB10, 10, },
++	  V4L2_PIX_FMT_SRGGB10, 10, 2, },
+ 	{ V4L2_MBUS_FMT_SBGGR12_1X12, V4L2_MBUS_FMT_SBGGR10_1X10,
+ 	  V4L2_MBUS_FMT_SBGGR12_1X12, V4L2_MBUS_FMT_SBGGR8_1X8,
+-	  V4L2_PIX_FMT_SBGGR12, 12, },
++	  V4L2_PIX_FMT_SBGGR12, 12, 2, },
+ 	{ V4L2_MBUS_FMT_SGBRG12_1X12, V4L2_MBUS_FMT_SGBRG10_1X10,
+ 	  V4L2_MBUS_FMT_SGBRG12_1X12, V4L2_MBUS_FMT_SGBRG8_1X8,
+-	  V4L2_PIX_FMT_SGBRG12, 12, },
++	  V4L2_PIX_FMT_SGBRG12, 12, 2, },
+ 	{ V4L2_MBUS_FMT_SGRBG12_1X12, V4L2_MBUS_FMT_SGRBG10_1X10,
+ 	  V4L2_MBUS_FMT_SGRBG12_1X12, V4L2_MBUS_FMT_SGRBG8_1X8,
+-	  V4L2_PIX_FMT_SGRBG12, 12, },
++	  V4L2_PIX_FMT_SGRBG12, 12, 2, },
+ 	{ V4L2_MBUS_FMT_SRGGB12_1X12, V4L2_MBUS_FMT_SRGGB10_1X10,
+ 	  V4L2_MBUS_FMT_SRGGB12_1X12, V4L2_MBUS_FMT_SRGGB8_1X8,
+-	  V4L2_PIX_FMT_SRGGB12, 12, },
++	  V4L2_PIX_FMT_SRGGB12, 12, 2, },
+ 	{ V4L2_MBUS_FMT_UYVY8_1X16, V4L2_MBUS_FMT_UYVY8_1X16,
+ 	  V4L2_MBUS_FMT_UYVY8_1X16, 0,
+-	  V4L2_PIX_FMT_UYVY, 16, },
++	  V4L2_PIX_FMT_UYVY, 16, 2, },
+ 	{ V4L2_MBUS_FMT_YUYV8_1X16, V4L2_MBUS_FMT_YUYV8_1X16,
+ 	  V4L2_MBUS_FMT_YUYV8_1X16, 0,
+-	  V4L2_PIX_FMT_YUYV, 16, },
++	  V4L2_PIX_FMT_YUYV, 16, 2, },
++	{ V4L2_MBUS_FMT_UYVY8_2X8, V4L2_MBUS_FMT_UYVY8_2X8,
++	  V4L2_MBUS_FMT_UYVY8_2X8, 0,
++	  V4L2_PIX_FMT_UYVY, 8, 2, },
++	{ V4L2_MBUS_FMT_YUYV8_2X8, V4L2_MBUS_FMT_YUYV8_2X8,
++	  V4L2_MBUS_FMT_YUYV8_2X8, 0,
++	  V4L2_PIX_FMT_YUYV, 8, 2, },
++	/* Empty entry to catch the unsupported pixel code (0) used by the CCDC
++	 * module and avoid NULL pointer dereferences.
++	 */
++	{ 0, }
+ };
+ 
+ const struct isp_format_info *
+@@ -141,9 +151,9 @@
+  *
+  * Return the number of padding bytes at end of line.
+  */
+-static unsigned int isp_video_mbus_to_pix(const struct isp_video *video,
+-					  const struct v4l2_mbus_framefmt *mbus,
+-					  struct v4l2_pix_format *pix)
++unsigned int isp_video_mbus_to_pix(const struct isp_video *video,
++                                   const struct v4l2_mbus_framefmt *mbus,
++                                   struct v4l2_pix_format *pix)
+ {
+ 	unsigned int bpl = pix->bytesperline;
+ 	unsigned int min_bpl;
+@@ -161,7 +171,7 @@
+ 	if (WARN_ON(i == ARRAY_SIZE(formats)))
+ 		return 0;
+ 
+-	min_bpl = pix->width * ALIGN(formats[i].bpp, 8) / 8;
++	min_bpl = pix->width * formats[i].bpp;
+ 
+ 	/* Clamp the requested bytes per line value. If the maximum bytes per
+ 	 * line value is zero, the module doesn't support user configurable line
+@@ -662,6 +672,29 @@
+ }
+ 
+ static int
++isp_video_enum_format(struct file *file, void *fh, struct v4l2_fmtdesc *fmtdesc)
++{
++       struct isp_video_fh *vfh = to_isp_video_fh(fh);
++       struct isp_video *video = video_drvdata(file);
++
++       if (fmtdesc->index)
++               return -EINVAL;
++
++       if (fmtdesc->type != video->type)
++               return -EINVAL;
++
++       fmtdesc->flags = 0;
++       fmtdesc->description[0] = 0;
++
++
++       mutex_lock(&video->mutex);
++       fmtdesc->pixelformat = V4L2_PIX_FMT_UYVY;
++       mutex_unlock(&video->mutex);
++
++       return 0;
++}
++
++static int
+ isp_video_get_format(struct file *file, void *fh, struct v4l2_format *format)
+ {
+ 	struct isp_video_fh *vfh = to_isp_video_fh(fh);
+@@ -921,7 +954,8 @@
+ 		return ret;
+ 	}
+ 
+-	pipe->external_bpp = omap3isp_video_format_info(fmt.format.code)->bpp;
++	pipe->external_width =
++		omap3isp_video_format_info(fmt.format.code)->width;
+ 
+ 	memset(&ctrls, 0, sizeof(ctrls));
+ 	memset(&ctrl, 0, sizeof(ctrl));
+@@ -935,7 +969,7 @@
+ 	if (ret < 0) {
+ 		dev_warn(isp->dev, "no pixel rate control in subdev %s\n",
+ 			 pipe->external->name);
+-		return ret;
++		//return ret;
+ 	}
+ 
+ 	pipe->external_rate = ctrl.value64;
+@@ -947,8 +981,10 @@
+ 		 * exceeded by the pixel rate.
+ 		 */
+ 		omap3isp_ccdc_max_rate(&isp->isp_ccdc, &rate);
++/*
+ 		if (pipe->external_rate > rate)
+ 			return -ENOSPC;
++*/
+ 	}
+ 
+ 	return 0;
+@@ -1191,6 +1227,7 @@
+ 
+ static const struct v4l2_ioctl_ops isp_video_ioctl_ops = {
+ 	.vidioc_querycap		= isp_video_querycap,
++        .vidioc_enum_fmt_vid_cap        = isp_video_enum_format,
+ 	.vidioc_g_fmt_vid_cap		= isp_video_get_format,
+ 	.vidioc_s_fmt_vid_cap		= isp_video_set_format,
+ 	.vidioc_try_fmt_vid_cap		= isp_video_try_format,
+Index: git/drivers/media/video/omap3isp/ispvideo.h
+===================================================================
+--- git.orig/drivers/media/video/omap3isp/ispvideo.h	2012-10-23 10:10:18.819169503 -0500
++++ git/drivers/media/video/omap3isp/ispvideo.h	2012-10-23 10:10:28.067169309 -0500
+@@ -51,7 +51,8 @@
+  * @flavor: V4L2 media bus format code for the same pixel layout but
+  *	shifted to be 8 bits per pixel. =0 if format is not shiftable.
+  * @pixelformat: V4L2 pixel format FCC identifier
+- * @bpp: Bits per pixel
++ * @width: Bits per pixel (when transferred over a bus)
++ * @bpp: Bytes per pixel (when stored in memory)
+  */
+ struct isp_format_info {
+ 	enum v4l2_mbus_pixelcode code;
+@@ -59,6 +60,7 @@
+ 	enum v4l2_mbus_pixelcode uncompressed;
+ 	enum v4l2_mbus_pixelcode flavor;
+ 	u32 pixelformat;
++	unsigned int width;
+ 	unsigned int bpp;
+ };
+ 
+@@ -106,7 +108,7 @@
+ 	struct v4l2_fract max_timeperframe;
+ 	struct v4l2_subdev *external;
+ 	unsigned int external_rate;
+-	unsigned int external_bpp;
++	unsigned int external_width;
+ };
+ 
+ #define to_isp_pipeline(__e) \
+@@ -207,6 +209,9 @@
+ struct isp_buffer *omap3isp_video_buffer_next(struct isp_video *video);
+ void omap3isp_video_resume(struct isp_video *video, int continuous);
+ struct media_pad *omap3isp_video_remote_pad(struct isp_video *video);
++extern unsigned int isp_video_mbus_to_pix(const struct isp_video *video,
++                                          const struct v4l2_mbus_framefmt *mbus,
++                                          struct v4l2_pix_format *pix);
+ 
+ const struct isp_format_info *
+ omap3isp_video_format_info(enum v4l2_mbus_pixelcode code);
+Index: git/include/media/omap3isp.h
+===================================================================
+--- git.orig/include/media/omap3isp.h	2012-10-23 10:10:22.183169431 -0500
++++ git/include/media/omap3isp.h	2012-10-23 10:10:28.067169309 -0500
+@@ -42,12 +42,6 @@
+ };
+ 
+ enum {
+-	ISP_BRIDGE_DISABLE = 0,
+-	ISP_BRIDGE_LITTLE_ENDIAN = 2,
+-	ISP_BRIDGE_BIG_ENDIAN = 3,
+-};
+-
+-enum {
+ 	ISP_LANE_SHIFT_0 = 0,
+ 	ISP_LANE_SHIFT_2 = 1,
+ 	ISP_LANE_SHIFT_4 = 2,
+@@ -67,17 +61,21 @@
+  *		0 - Active high, 1 - Active low
+  * @vs_pol: Vertical synchronization polarity
+  *		0 - Active high, 1 - Active low
+- * @bridge: CCDC Bridge input control
+- *		ISP_BRIDGE_DISABLE - Disable
+- *		ISP_BRIDGE_LITTLE_ENDIAN - Little endian
+- *		ISP_BRIDGE_BIG_ENDIAN - Big endian
++ * @data_pol: Data polarity
++ *		0 - Normal, 1 - One's complement
++ * @bt656: ITU-R BT656 embedded synchronization
++ *		0 - HS/VS sync, 1 - BT656 sync
++ * @fldmode: Field mode
++ *             0 - progressive, 1 - Interlaced
+  */
+ struct isp_parallel_platform_data {
+ 	unsigned int data_lane_shift:2;
+ 	unsigned int clk_pol:1;
+ 	unsigned int hs_pol:1;
+ 	unsigned int vs_pol:1;
+-	unsigned int bridge:2;
++	unsigned int data_pol:1;
++	unsigned int bt656:1;
++	unsigned int fldmode:1;
+ };
+ 
+ enum {

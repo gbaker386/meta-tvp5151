@@ -1,0 +1,109 @@
+diff --git git/arch/arm/mach-omap2/board-overo.c-orig git/arch/arm/mach-omap2/board-overo.c
+index 460ae96..bc7a7fb 100644
+--- git/arch/arm/mach-omap2/board-overo.c-orig
++++ git/arch/arm/mach-omap2/board-overo.c
+@@ -75,57 +75,39 @@
+ 
+ #if defined(CONFIG_VIDEO_OMAP3) || defined(CONFIG_VIDEO_OMAP3_MODULE)
+ 
+-#include <media/mt9v032.h>
++#include <media/tvp5150.h>
+ #include "devices.h"
+ #include "../../../drivers/media/video/omap3isp/isp.h"
+ 
+-#define MT9V032_I2C_ADDR	0x5C
+-#define MT9V032_I2C_BUS_NUM	3
++#define TVP5150_I2C_ADDR	0x5C
++#define TVP5150_I2C_BUS_NUM	3
++#define TVP5150_RESET		108
+ 
+-static void mt9v032_set_clock(struct v4l2_subdev *subdev, unsigned int rate)
+-{
+-	struct isp_device *isp = v4l2_dev_to_isp_device(subdev->v4l2_dev);
+-
+-	isp->platform_cb.set_xclk(isp, rate, ISP_XCLK_A);
+-}
+-
+-static const s64 mt9v032_link_freqs[] = {
+-	13000000,
+-	26600000,
+-	27000000,
+-	0,
++static struct i2c_board_info tvp5150_i2c_device = {
++	I2C_BOARD_INFO("tvp5150", TVP5150_I2C_ADDR),
+ };
+ 
+-static struct mt9v032_platform_data mt9v032_platform_data = {
+-	.clk_pol = 0,
+-	.set_clock = mt9v032_set_clock,
+-	.link_freqs = mt9v032_link_freqs,
+-	.link_def_freq = 26600000,
+-};
+-
+-static struct i2c_board_info mt9v032_i2c_device = {
+-	I2C_BOARD_INFO("mt9v032", MT9V032_I2C_ADDR),
+-	.platform_data = &mt9v032_platform_data,
+-};
+-
+-static struct isp_subdev_i2c_board_info mt9v032_subdevs[] = {
++static struct isp_subdev_i2c_board_info tvp5150_subdevs[] = {
+ 	{
+-		.board_info = &mt9v032_i2c_device,
+-		.i2c_adapter_id = MT9V032_I2C_BUS_NUM,
++		.board_info = &tvp5150_i2c_device,
++		.i2c_adapter_id = TVP5150_I2C_BUS_NUM,
+ 	},
+ 	{ NULL, 0, },
+ };
+ 
+ static struct isp_v4l2_subdevs_group overo_camera_subdevs[] = {
+ 	{
+-		.subdevs = mt9v032_subdevs,
++		.subdevs = tvp5150_subdevs,
+ 		.interface = ISP_INTERFACE_PARALLEL,
+ 		.bus = {
+-				.parallel = {
+-					.data_lane_shift = 0,
+-					.clk_pol = 0,
+-					.bridge = ISPCTRL_PAR_BRIDGE_DISABLE,
+-				}
++			.parallel = {
++				.bt656 = 1,
++				.fldmode = 1,
++				.data_lane_shift = 0,
++				.clk_pol = 0,
++				.hs_pol = 0,
++				.vs_pol = 0,
++			}
+ 		},
+ 	},
+ 	{ NULL, 0, },
+@@ -137,7 +119,18 @@ static struct isp_platform_data overo_isp_platform_data = {
+ 
+ static int __init overo_camera_init(void)
+ {
+-       return omap3_init_camera(&overo_isp_platform_data);
++	int ret;
++
++	printk("overo_camera_init\n");
++
++        ret = gpio_request_one(TVP5150_RESET, GPIOF_OUT_INIT_LOW,
++                               "TVP5150_RESET");
++        if (ret == 0)
++                gpio_export(TVP5150_RESET, 0);
++        else
++                printk(KERN_ERR "could not obtain gpio for TVP5150_RESET\n");
++
++        return omap3_init_camera(&overo_isp_platform_data);
+ }
+ 
+ #else
+@@ -555,7 +548,7 @@ static int __init overo_i2c_init(void)
+ 
+ 	omap3_pmic_init("tps65950", &overo_twldata);
+ 	/* i2c2 pins are used for gpio */
+-	omap_register_i2c_bus(3, 400, NULL, 0);
++	omap_register_i2c_bus(3, 100, NULL, 0);
+ 	return 0;
+ }
+ 

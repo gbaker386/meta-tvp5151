@@ -1,0 +1,390 @@
+Index: git/drivers/media/video/tvp5150.c
+===================================================================
+--- git.orig/drivers/media/video/tvp5150.c	2012-09-16 14:54:43.828225708 -0500
++++ git/drivers/media/video/tvp5150.c	2012-09-16 14:54:52.104225867 -0500
+@@ -14,6 +14,8 @@
+ #include <media/tvp5150.h>
+ #include <media/v4l2-chip-ident.h>
+ #include <media/v4l2-ctrls.h>
++#include <media/v4l2-mediabus.h>
++#include <media/v4l2-subdev.h>
+ 
+ #include "tvp5150_reg.h"
+ 
+@@ -34,7 +36,8 @@
+ MODULE_PARM_DESC(debug, "Debug level (0-2)");
+ 
+ struct tvp5150 {
+-	struct v4l2_subdev sd;
++	struct v4l2_subdev subdev;
++        struct media_pad pad;
+ 	struct v4l2_ctrl_handler hdl;
+ 	struct v4l2_rect rect;
+ 
+@@ -46,12 +49,12 @@
+ 
+ static inline struct tvp5150 *to_tvp5150(struct v4l2_subdev *sd)
+ {
+-	return container_of(sd, struct tvp5150, sd);
++	return container_of(sd, struct tvp5150, subdev);
+ }
+ 
+ static inline struct v4l2_subdev *to_sd(struct v4l2_ctrl *ctrl)
+ {
+-	return &container_of(ctrl->handler, struct tvp5150, hdl)->sd;
++	return &container_of(ctrl->handler, struct tvp5150, hdl)->subdev;
+ }
+ 
+ static int tvp5150_read(struct v4l2_subdev *sd, unsigned char addr)
+@@ -830,18 +833,25 @@
+ 			    struct v4l2_mbus_framefmt *f)
+ {
+ 	struct tvp5150 *decoder = to_tvp5150(sd);
++	v4l2_std_id std;
+ 
+ 	if (f == NULL)
+ 		return -EINVAL;
+ 
+ 	tvp5150_reset(sd, 0);
+ 
++	/* Calculate height and width based on current standard */
++	if (decoder->norm == V4L2_STD_ALL)
++		std = tvp5150_read_std(sd);
++	else
++		std = decoder->norm;
++
+ 	f->width = decoder->rect.width;
+ 	f->height = decoder->rect.height;
+ 
+ 	f->code = V4L2_MBUS_FMT_UYVY8_2X8;
+-	f->field = V4L2_FIELD_SEQ_TB;
+-	f->colorspace = V4L2_COLORSPACE_SMPTE170M;
++	f->field = V4L2_FIELD_INTERLACED;
++	f->colorspace = V4L2_COLORSPACE_SRGB;
+ 
+ 	v4l2_dbg(1, debug, sd, "width = %d, height = %d\n", f->width,
+ 			f->height);
+@@ -903,7 +913,7 @@
+ 
+ static int tvp5150_g_crop(struct v4l2_subdev *sd, struct v4l2_crop *a)
+ {
+-	struct tvp5150 *decoder = container_of(sd, struct tvp5150, sd);
++	struct tvp5150 *decoder = container_of(sd, struct tvp5150, subdev);
+ 
+ 	a->c	= decoder->rect;
+ 	a->type	= V4L2_BUF_TYPE_VIDEO_CAPTURE;
+@@ -913,7 +923,7 @@
+ 
+ static int tvp5150_cropcap(struct v4l2_subdev *sd, struct v4l2_cropcap *a)
+ {
+-	struct tvp5150 *decoder = container_of(sd, struct tvp5150, sd);
++	struct tvp5150 *decoder = container_of(sd, struct tvp5150, subdev);
+ 	v4l2_std_id std;
+ 
+ 	if (a->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
+@@ -941,22 +951,94 @@
+ 	return 0;
+ }
+ 
++ /****************************************************************************
++			V4L2 subdev pad ops
++ ****************************************************************************/
++
++static int tvp5150_set_format(struct v4l2_subdev *subdev,
++                              struct v4l2_subdev_fh *fh,
++                              struct v4l2_subdev_format *format)
++{
++        format->format.code = V4L2_MBUS_FMT_UYVY8_2X8;
++        format->format.width = 720;
++        format->format.height = 480;
++        format->format.field = V4L2_FIELD_INTERLACED,
++        format->format.colorspace = V4L2_COLORSPACE_SRGB;
++
++        return 0;
++}
++
++static int tvp5150_get_format(struct v4l2_subdev *subdev,
++                              struct v4l2_subdev_fh *fh,
++                              struct v4l2_subdev_format *format)
++{
++        format->format.code = V4L2_MBUS_FMT_UYVY8_2X8;
++        format->format.width = 720;
++        format->format.height = 480;
++        format->format.field = V4L2_FIELD_INTERLACED;
++        format->format.colorspace = V4L2_COLORSPACE_SRGB;
++
++        return 0;
++}
++
++static int tvp5150_enum_mbus_code(struct v4l2_subdev *subdev,
++                                  struct v4l2_subdev_fh *fh,
++                                  struct v4l2_subdev_mbus_code_enum *code)
++{
++        if (code->index > 0)
++                return -EINVAL;
++
++        code->code = V4L2_MBUS_FMT_UYVY8_2X8;
++        return 0;
++}
++
++static int tvp5150_enum_frame_size(struct v4l2_subdev *subdev,
++                                   struct v4l2_subdev_fh *fh,
++                                   struct v4l2_subdev_frame_size_enum *fse)
++{
++        if (fse->index >= 8 || fse->code != V4L2_MBUS_FMT_UYVY8_2X8)
++                return -EINVAL;
++
++        fse->code = V4L2_MBUS_FMT_UYVY8_2X8;
++        fse->min_width = 720;
++        fse->max_width = 720;
++        fse->min_height = 480;
++        fse->max_height = 480;
++
++        return 0;
++}
++
+ /****************************************************************************
+ 			I2C Command
+  ****************************************************************************/
+ 
+-static int tvp5150_s_routing(struct v4l2_subdev *sd,
++static int tvp5150_s_stream(struct v4l2_subdev *subdev, int enable)
++{
++	/* Initializes TVP5150 to its default values */
++	/* # set PCLK (27MHz) */
++	tvp5150_write(subdev, TVP5150_CONF_SHARED_PIN, 0x00);
++
++	/* Output format: 8-bit ITU-R BT.656 with embedded syncs */
++	if (enable)
++		tvp5150_write(subdev, TVP5150_MISC_CTL, 0x09);
++	else
++		tvp5150_write(subdev, TVP5150_MISC_CTL, 0x00);
++	//tvp5150_log_status(subdev);
++	return 0;
++}
++
++static int tvp5150_s_routing(struct v4l2_subdev *subdev,
+ 			     u32 input, u32 output, u32 config)
+ {
+-	struct tvp5150 *decoder = to_tvp5150(sd);
++	struct tvp5150 *decoder = to_tvp5150(subdev);
+ 
+ 	decoder->input = input;
+ 	decoder->output = output;
+-	tvp5150_selmux(sd);
++	tvp5150_selmux(subdev);
+ 	return 0;
+ }
+ 
+-static int tvp5150_s_raw_fmt(struct v4l2_subdev *sd, struct v4l2_vbi_format *fmt)
++static int tvp5150_s_raw_fmt(struct v4l2_subdev *subdev, struct v4l2_vbi_format *fmt)
+ {
+ 	/* this is for capturing 36 raw vbi lines
+ 	   if there's a way to cut off the beginning 2 vbi lines
+@@ -964,10 +1046,10 @@
+ 	   to 17 lines/field again, although I couldn't find a register
+ 	   which could do that cropping */
+ 	if (fmt->sample_format == V4L2_PIX_FMT_GREY)
+-		tvp5150_write(sd, TVP5150_LUMA_PROC_CTL_1, 0x70);
++		tvp5150_write(subdev, TVP5150_LUMA_PROC_CTL_1, 0x70);
+ 	if (fmt->count[0] == 18 && fmt->count[1] == 18) {
+-		tvp5150_write(sd, TVP5150_VERT_BLANKING_START, 0x00);
+-		tvp5150_write(sd, TVP5150_VERT_BLANKING_STOP, 0x01);
++		tvp5150_write(subdev, TVP5150_VERT_BLANKING_START, 0x00);
++		tvp5150_write(subdev, TVP5150_VERT_BLANKING_STOP, 0x01);
+ 	}
+ 	return 0;
+ }
+@@ -1092,6 +1174,8 @@
+ };
+ 
+ static const struct v4l2_subdev_video_ops tvp5150_video_ops = {
++        .s_stream = tvp5150_s_stream,
++/*
+ 	.s_routing = tvp5150_s_routing,
+ 	.enum_mbus_fmt = tvp5150_enum_mbus_fmt,
+ 	.s_mbus_fmt = tvp5150_mbus_fmt,
+@@ -1100,6 +1184,7 @@
+ 	.s_crop = tvp5150_s_crop,
+ 	.g_crop = tvp5150_g_crop,
+ 	.cropcap = tvp5150_cropcap,
++*/
+ };
+ 
+ static const struct v4l2_subdev_vbi_ops tvp5150_vbi_ops = {
+@@ -1109,11 +1194,19 @@
+ 	.s_raw_fmt = tvp5150_s_raw_fmt,
+ };
+ 
+-static const struct v4l2_subdev_ops tvp5150_ops = {
++static const struct v4l2_subdev_pad_ops tvp5150_pad_ops = {
++        .enum_mbus_code = tvp5150_enum_mbus_code,
++        .enum_frame_size = tvp5150_enum_frame_size,
++        .get_fmt = tvp5150_get_format,
++        .set_fmt = tvp5150_set_format,
++};
++
++static const struct v4l2_subdev_ops tvp5150cam_subdev_ops = {
+ 	.core = &tvp5150_core_ops,
+ 	.tuner = &tvp5150_tuner_ops,
+ 	.video = &tvp5150_video_ops,
+ 	.vbi = &tvp5150_vbi_ops,
++        .pad = &tvp5150_pad_ops,
+ };
+ 
+ 
+@@ -1121,81 +1214,81 @@
+ 			I2C Client & Driver
+  ****************************************************************************/
+ 
+-static int tvp5150_probe(struct i2c_client *c,
+-			 const struct i2c_device_id *id)
++static int tvp5150_probe(struct i2c_client *client,
++			 const struct i2c_device_id *did)
+ {
+-	struct tvp5150 *core;
+-	struct v4l2_subdev *sd;
++	struct tvp5150 *tvp5150cam;
++        struct v4l2_subdev *sd;
+ 	u8 msb_id, lsb_id, msb_rom, lsb_rom;
++        int ret;
+ 
+-	/* Check if the adapter supports the needed features */
+-	if (!i2c_check_functionality(c->adapter,
+-	     I2C_FUNC_SMBUS_READ_BYTE | I2C_FUNC_SMBUS_WRITE_BYTE_DATA))
+-		return -EIO;
++        printk("tvp5150 probe\n");
+ 
+-	core = kzalloc(sizeof(struct tvp5150), GFP_KERNEL);
+-	if (!core) {
++	tvp5150cam = kzalloc(sizeof(struct tvp5150), GFP_KERNEL);
++	if (!tvp5150cam) {
+ 		return -ENOMEM;
+ 	}
+-	sd = &core->sd;
+-	v4l2_i2c_subdev_init(sd, c, &tvp5150_ops);
+-	v4l_info(c, "chip found @ 0x%02x (%s)\n",
+-		 c->addr << 1, c->adapter->name);
+-
+-	msb_id = tvp5150_read(sd, TVP5150_MSB_DEV_ID);
+-	lsb_id = tvp5150_read(sd, TVP5150_LSB_DEV_ID);
+-	msb_rom = tvp5150_read(sd, TVP5150_ROM_MAJOR_VER);
+-	lsb_rom = tvp5150_read(sd, TVP5150_ROM_MINOR_VER);
+ 
+-	if (msb_rom == 4 && lsb_rom == 0) { /* Is TVP5150AM1 */
+-		v4l2_info(sd, "tvp%02x%02xam1 detected.\n", msb_id, lsb_id);
++	v4l2_i2c_subdev_init(&tvp5150cam->subdev, client, &tvp5150cam_subdev_ops);
++	tvp5150cam->subdev.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
+ 
+-		/* ITU-T BT.656.4 timing */
+-		tvp5150_write(sd, TVP5150_REV_SELECT, 0);
+-	} else {
+-		if (msb_rom == 3 || lsb_rom == 0x21) { /* Is TVP5150A */
+-			v4l2_info(sd, "tvp%02x%02xa detected.\n", msb_id, lsb_id);
+-		} else {
+-			v4l2_info(sd, "*** unknown tvp%02x%02x chip detected.\n",
+-					msb_id, lsb_id);
+-			v4l2_info(sd, "*** Rom ver is %d.%d\n", msb_rom, lsb_rom);
+-		}
+-	}
++        tvp5150cam->pad.flags = MEDIA_PAD_FL_SOURCE;
++        ret = media_entity_init(&tvp5150cam->subdev.entity, 1, &tvp5150cam->pad, 0);
++        if (ret < 0) {
++		kfree(tvp5150cam);
++                return ret;
++        }
++
++	msb_id = tvp5150_read(&tvp5150cam->subdev, TVP5150_MSB_DEV_ID);
++	lsb_id = tvp5150_read(&tvp5150cam->subdev, TVP5150_LSB_DEV_ID);
++	msb_rom = tvp5150_read(&tvp5150cam->subdev, TVP5150_ROM_MAJOR_VER);
++	lsb_rom = tvp5150_read(&tvp5150cam->subdev, TVP5150_ROM_MINOR_VER);
++
++        if (msb_id == 0x51 && lsb_id == 0x51) {
++                /* Is tvp5151 */
++                v4l2_info(&tvp5150cam->subdev, "tvp%02x%02x detected.\n", msb_id, lsb_id);
++                v4l2_info(&tvp5150cam->subdev, "*** Rom ver is %d.%d\n", msb_rom, lsb_rom);
++        }
++        else {
++                v4l2_info(&tvp5150cam->subdev, "ERROR: tvp5151 not detected\n");
++                return -ENODEV;
++        }
++
++        sd = &tvp5150cam->subdev;
++
++	tvp5150cam->norm = V4L2_STD_ALL;	/* Default is autodetect */
++	tvp5150cam->input = TVP5150_COMPOSITE1;
++	tvp5150cam->enable = 1;
+ 
+-	core->norm = V4L2_STD_ALL;	/* Default is autodetect */
+-	core->input = TVP5150_COMPOSITE1;
+-	core->enable = 1;
+-
+-	v4l2_ctrl_handler_init(&core->hdl, 4);
+-	v4l2_ctrl_new_std(&core->hdl, &tvp5150_ctrl_ops,
++	v4l2_ctrl_handler_init(&tvp5150cam->hdl, 4);
++	v4l2_ctrl_new_std(&tvp5150cam->hdl, &tvp5150_ctrl_ops,
+ 			V4L2_CID_BRIGHTNESS, 0, 255, 1, 128);
+-	v4l2_ctrl_new_std(&core->hdl, &tvp5150_ctrl_ops,
++	v4l2_ctrl_new_std(&tvp5150cam->hdl, &tvp5150_ctrl_ops,
+ 			V4L2_CID_CONTRAST, 0, 255, 1, 128);
+-	v4l2_ctrl_new_std(&core->hdl, &tvp5150_ctrl_ops,
++	v4l2_ctrl_new_std(&tvp5150cam->hdl, &tvp5150_ctrl_ops,
+ 			V4L2_CID_SATURATION, 0, 255, 1, 128);
+-	v4l2_ctrl_new_std(&core->hdl, &tvp5150_ctrl_ops,
++	v4l2_ctrl_new_std(&tvp5150cam->hdl, &tvp5150_ctrl_ops,
+ 			V4L2_CID_HUE, -128, 127, 1, 0);
+-	sd->ctrl_handler = &core->hdl;
+-	if (core->hdl.error) {
+-		int err = core->hdl.error;
++	sd->ctrl_handler = &tvp5150cam->hdl;
++	if (tvp5150cam->hdl.error) {
++		int err = tvp5150cam->hdl.error;
+ 
+-		v4l2_ctrl_handler_free(&core->hdl);
+-		kfree(core);
++		v4l2_ctrl_handler_free(&tvp5150cam->hdl);
++		kfree(tvp5150cam);
+ 		return err;
+ 	}
+-	v4l2_ctrl_handler_setup(&core->hdl);
++	v4l2_ctrl_handler_setup(&tvp5150cam->hdl);
+ 
+ 	/* Default is no cropping */
+-	core->rect.top = 0;
+-	if (tvp5150_read_std(sd) & V4L2_STD_525_60)
+-		core->rect.height = TVP5150_V_MAX_525_60;
++	tvp5150cam->rect.top = 0;
++	if (tvp5150_read_std(&tvp5150cam->subdev) & V4L2_STD_525_60)
++		tvp5150cam->rect.height = TVP5150_V_MAX_525_60;
+ 	else
+-		core->rect.height = TVP5150_V_MAX_OTHERS;
+-	core->rect.left = 0;
+-	core->rect.width = TVP5150_H_MAX;
++		tvp5150cam->rect.height = TVP5150_V_MAX_OTHERS;
++	tvp5150cam->rect.left = 0;
++	tvp5150cam->rect.width = TVP5150_H_MAX;
+ 
+-	if (debug > 1)
+-		tvp5150_log_status(sd);
++	//tvp5150_log_status(&tvp5150cam->subdev);
+ 	return 0;
+ }
+ 
+@@ -1232,4 +1325,16 @@
+ 	.id_table	= tvp5150_id,
+ };
+ 
+-module_i2c_driver(tvp5150_driver);
++static int __init tvp5150_init(void)
++{
++        return i2c_add_driver(&tvp5150_driver);
++}
++
++static void __exit tvp5150_exit(void)
++{
++        i2c_del_driver(&tvp5150_driver);
++}
++
++module_init(tvp5150_init);
++module_exit(tvp5150_exit);
++
