@@ -1,5 +1,5 @@
 # Local configuration for meta-tvp5151 images
-# Yocto Project 1.4.2 Poky distribution 9.0.2, [dylan] branch
+# Yocto Project 1.4.3 Poky distribution 9.0.3, [dylan] branch
 
 BBMASK = "meta-gumstix/recipes-connectivity"
 BBMASK .= "|meta-ti/recipes-misc"
