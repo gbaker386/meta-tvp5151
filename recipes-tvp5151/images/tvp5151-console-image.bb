@@ -98,6 +98,7 @@ IMAGE_INSTALL += " \
     ${ALSA_TOOLS} \
     ${MISC_EXTRA} \
     ${WIFI_SUPPORT} \
+    ${V4L_TOOLS} \
  "
 
 set_local_timezone() {
