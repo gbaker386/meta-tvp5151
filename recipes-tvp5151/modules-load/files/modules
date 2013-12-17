@@ -1,0 +1,5 @@
+# Kernel modules to load at startup
+
+# Load a gadget driver to allow host port scanning on the OTG port
+g_serial
+

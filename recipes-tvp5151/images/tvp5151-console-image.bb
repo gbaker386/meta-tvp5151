@@ -25,6 +25,7 @@ KERNEL_MODULES_OOT = " \
 KERNEL_EXTRA_INSTALL = " \
     kernel-modules \
     ${KERNEL_MODULES_OOT} \
+    modules-load \
  "
 
 WIFI_SUPPORT = " \
